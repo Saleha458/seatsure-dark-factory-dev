@@ -315,6 +315,36 @@ class Contracts(unittest.TestCase):
         self.create('independent', restaurant_id='r2')
         self.expect(409, 'POST', '/reservations', self.body(), token=self.token, key='occupied', code='table_unavailable')
 
+    def test_fixture_id_limits_and_unknown_fields_preserve_contract(self):
+        data = fixture()
+        data['users'][0]['id'] = 'u' * 64
+        data['restaurants'][0]['id'] = 'r' * 64
+        data['restaurants'][0]['tables'][0]['id'] = 't' * 64
+        data['unknown'] = {'ignored': True}
+        self.reset(data); self.token = self.login()
+        created = self.create(restaurant_id='r' * 64, table_id='t' * 64, ignored='accepted')
+        self.assertEqual(created['restaurant_id'], 'r' * 64)
+        before = self.snapshot()
+        for field in ('user', 'restaurant', 'table'):
+            invalid = copy.deepcopy(data)
+            target = invalid['users'][0] if field == 'user' else invalid['restaurants'][0]
+            if field == 'table':
+                target = target['tables'][0]
+            target['id'] = 'x' * 65
+            self.expect(422, 'POST', '/_test/reset', invalid, code='validation_failed')
+            self.unchanged(before)
+
+    def test_signup_concurrency_and_unicode_password_length(self):
+        body = {'email': 'unicode@example.test', 'password': 'é' * 8, 'display_name': 'Zoë', 'unknown': True}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.call('POST', '/auth/signup', body), range(2)))
+        self.assertEqual(sorted(status for status, _ in results), [201, 409])
+        failure = next(value for status, value in results if status == 409)
+        self.assertEqual(failure['error']['code'], 'email_taken')
+        logged = self.expect(200, 'POST', '/auth/login', {'email': body['email'], 'password': body['password']})
+        self.assertEqual(logged['display_name'], body['display_name'])
+        self.expect(422, 'POST', '/auth/signup', dict(body, email='short@example.test', password='é' * 7), code='validation_failed')
+
     def test_batch_shape_one_eight_nine_and_cross_owner_restaurant(self):
         data = fixture()
         second = copy.deepcopy(data['restaurants'][0]); second['id'] = 'r2'
