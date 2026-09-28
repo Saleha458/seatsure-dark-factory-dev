@@ -269,6 +269,11 @@ class Contracts(unittest.TestCase):
                 booking = self.create('fold', starts_at_local=fall + 'T' + repeated)
                 self.assertEqual(booking['ends_at'], fall + 'T' + end)
                 self.assertEqual((dt.datetime.fromisoformat(booking['ends_at']) - dt.datetime.fromisoformat(booking['starts_at'])).total_seconds(), 5400)
+                if zone == 'Europe/Berlin':
+                    before_fold = self.create('before-fold', table_id='t2', starts_at_local=fall + 'T01:30')
+                    self.assertEqual(before_fold['starts_at'], fall + 'T01:30:00+02:00')
+                    self.assertEqual(before_fold['ends_at'], fall + 'T02:00:00+01:00')
+                    self.assertEqual((dt.datetime.fromisoformat(before_fold['ends_at']) - dt.datetime.fromisoformat(before_fold['starts_at'])).total_seconds(), 5400)
 
     def test_import_field_types_reject_with_422_and_leave_all_state_unchanged(self):
         self.create()
