@@ -80,11 +80,13 @@ def availability(state, query):
     day = parse_date(date)
     size = field(query, "party_size", str)
     require(re.fullmatch(r"[0-9]+", size) is not None)
-    # Compare decimal length before int conversion; enormous parties fit no table.
+    # Canonical decimal ordering is exact and avoids int's digit-conversion limit.
     normalized = size.lstrip("0")
     require(normalized)
-    size = int(normalized) if len(normalized) < 100 else 10 ** 100
     config = restaurant(state, rid)
+    fitting_tables = [table for table in config["tables"]
+                      if (len(normalized), normalized) <=
+                      (len(str(table["capacity"])), str(table["capacity"]))]
     result = {"restaurant_id": rid, "date": date, "timezone": config["timezone"], "slots": []}
     bounds = window(config, day)
     if bounds is None:
@@ -101,9 +103,9 @@ def availability(state, query):
                 raise
         else:
             available = []
-            for table in config["tables"]:
+            for table in fitting_tables:
                 probe = {"restaurant_id": rid, "table_id": table["id"], "starts_at": start, "ends_at": end}
-                if table["capacity"] >= size and not any(
+                if not any(
                     r["status"] == "confirmed" and overlaps(probe, r)
                     for r in state["reservations"].values()
                 ):

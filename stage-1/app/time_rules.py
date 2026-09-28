@@ -64,6 +64,14 @@ def window(restaurant, day):
     return opening, closing, boundary(opening, zone), boundary(closing, zone)
 
 
+def rfc3339(value):
+    # RFC3339 cannot express historical IANA offsets containing seconds.
+    # UTC preserves the instant without rounding or truncating that offset.
+    if value.utcoffset().total_seconds() % 60:
+        value = value.astimezone(UTC)
+    return value.isoformat()
+
+
 def interval(restaurant, value):
     local = parse_local(value)
     start = resolve_local(local, restaurant["timezone"])
@@ -79,7 +87,7 @@ def interval(restaurant, value):
             and end.astimezone(UTC) <= close_at.astimezone(UTC), 422, "outside_opening_hours")
     minutes = (local - opening).total_seconds() / 60
     require(minutes % restaurant["slot_minutes"] == 0, 422, "not_on_slot_grid")
-    return start.isoformat(), end.isoformat()
+    return rfc3339(start), rfc3339(end)
 
 
 def instant(value):

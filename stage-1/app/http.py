@@ -1,7 +1,7 @@
 """HTTP boundary. Network reads and writes never hold the state lock."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from .store import Store
 from .validation import APIError, finite_json, require
@@ -54,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
                     require(type(body) is dict and finite_json(body), 400, "malformed_request")
                 except (ValueError, UnicodeError, RecursionError):
                     raise APIError(400, "malformed_request") from None
-            status, result = self.server.store.dispatch(self.command, unquote(target.path),
+            status, result = self.server.store.dispatch(self.command, target.path,
                                                         dict(parse_qsl(target.query, keep_blank_values=True)),
                                                         body, self.headers)
         except APIError as exc:

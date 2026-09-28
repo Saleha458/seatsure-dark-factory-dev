@@ -5,6 +5,7 @@ import re
 import secrets
 from threading import RLock
 from uuid import uuid4
+from urllib.parse import unquote
 
 from . import reservations, security, transfer
 from .time_rules import UTC, instant
@@ -89,7 +90,7 @@ class Store:
                 return 200, {"restaurants": [{k: r[k] for k in ("id", "name", "timezone")}
                                               for r in state["restaurants"].values()]}
             if path.startswith("/restaurants/") and path.count("/") == 2:
-                rid = path.split("/")[2]
+                rid = unquote(path.split("/")[2])
                 require(0 < len(rid) <= 64)
                 return 200, reservations.restaurant(state, rid)
             if path == "/availability":
@@ -131,7 +132,7 @@ class Store:
             return 200, {"reservations": [reservations.public(r) for r in records]}
         parts = path.split("/")
         if len(parts) in (3, 4) and parts[1] == "reservations":
-            record = reservations.owned(state, parts[2], uid)
+            record = reservations.owned(state, unquote(parts[2]), uid)
             if method == "GET" and len(parts) == 3:
                 return 200, reservations.public(record)
             if method == "POST" and len(parts) == 4 and parts[3] == "cancel":
