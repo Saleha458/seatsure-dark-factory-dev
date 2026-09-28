@@ -423,6 +423,58 @@ class Contracts(unittest.TestCase):
         self.reset(base=PEER)
         self.expect(401, 'GET', '/reservations', token=self.token, base=PEER, code='unauthenticated')
 
+    def test_invalid_internal_import_state_rolls_back_accounts_occupancy_and_receipts(self):
+        # Export state is implementation-defined: these corruption locations use
+        # the delivered schema. Assertions remain entirely at the HTTP boundary.
+        original = self.create()
+        self.expect(201, 'POST', '/reservation-moves', {'moves': [{'reference': original['reference']}]}, token=self.token, key='batch')
+        before = self.snapshot()
+        rid = original['reservation_id']
+        cases = []
+        def corrupt(label, mutate):
+            value = copy.deepcopy(before)
+            mutate(value['state'])
+            cases.append((label, value))
+        for collection in ('users', 'tokens', 'restaurants', 'reservations', 'receipts'):
+            corrupt('missing ' + collection, lambda s, k=collection: s.pop(k))
+            corrupt('wrong type ' + collection, lambda s, k=collection: s.__setitem__(k, None))
+        corrupt('orphan token', lambda s: s['tokens'].__setitem__('synthetic_orphan', 'absent'))
+        corrupt('wrong user ID', lambda s: s['users']['u1'].__setitem__('id', 'mismatch'))
+        corrupt('duplicate email', lambda s: s['users']['u2'].__setitem__('email', s['users']['u1']['email']))
+        corrupt('unsafe hash parameters', lambda s: s['users']['u1']['credential'].__setitem__('n', 1))
+        corrupt('invalid digest', lambda s: s['users']['u1']['credential'].__setitem__('digest', 'bad'))
+        corrupt('invalid salt', lambda s: s['users']['u1']['credential'].__setitem__('salt', 'bad'))
+        corrupt('wrong restaurant ID', lambda s: s['restaurants']['r1'].__setitem__('id', 'mismatch'))
+        corrupt('invalid timezone', lambda s: s['restaurants']['r1'].__setitem__('timezone', 'Invalid/Zone'))
+        corrupt('duplicate table ID', lambda s: s['restaurants']['r1']['tables'].append(copy.deepcopy(s['restaurants']['r1']['tables'][0])))
+        for field, value in [('user_id', 'absent'), ('reservation_id', 'mismatch'), ('reference', 'bad'),
+                             ('status', 'unknown'), ('created_at', 'not-a-time'), ('ends_at', '2035-09-24T23:00:00+02:00'),
+                             ('table_id', 'absent'), ('party_size', True)]:
+            corrupt('invalid reservation ' + field, lambda s, f=field, v=value: s['reservations'][rid].__setitem__(f, v))
+        def overlap(state):
+            duplicate = copy.deepcopy(state['reservations'][rid])
+            duplicate.update(reservation_id='duplicate', reference='DUPL01')
+            state['reservations']['duplicate'] = duplicate
+        corrupt('confirmed overlap', overlap)
+        def duplicate_reference(state):
+            duplicate = copy.deepcopy(state['reservations'][rid])
+            duplicate.update(reservation_id='duplicate', status='cancelled')
+            state['reservations']['duplicate'] = duplicate
+        corrupt('duplicate reference', duplicate_reference)
+        corrupt('duplicate receipt', lambda s: s['receipts'].append(copy.deepcopy(s['receipts'][0])))
+        for field, value in [('user_id', 'absent'), ('method', 'GET'), ('path', '/unknown'), ('key', ''),
+                             ('request', []), ('response', {})]:
+            corrupt('invalid receipt ' + field, lambda s, f=field, v=value: s['receipts'][0].__setitem__(f, v))
+        corrupt('batch receipt missing record', lambda s: s['receipts'][1]['response'].__setitem__('reservations', []))
+        corrupt('batch receipt wrong reference', lambda s: s['receipts'][1]['request']['moves'][0].__setitem__('reference', 'WRONG1'))
+        for label, invalid in cases:
+            with self.subTest(corruption=label):
+                self.expect(422, 'POST', '/_test/import', invalid, code='validation_failed')
+                self.unchanged(before)
+                self.assertEqual(self.expect(200, 'GET', '/reservations/' + original['reference'], token=self.token), original)
+                self.assertEqual(self.expect(200, 'POST', '/reservations', self.body(), token=self.token, key='create'), original)
+        print(f'Invalid internal import cases: {len(cases)}; complete state and live token/receipt checked after each')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
