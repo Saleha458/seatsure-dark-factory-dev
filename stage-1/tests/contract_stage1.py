@@ -350,6 +350,21 @@ class Contracts(unittest.TestCase):
         self.assertEqual(logged['display_name'], body['display_name'])
         self.expect(422, 'POST', '/auth/signup', dict(body, email='short@example.test', password='é' * 7), code='validation_failed')
 
+    def test_escaped_surrogate_password_roundtrips_signup_login_and_reset(self):
+        password = chr(0xD800) * 8
+        account = {'email': 'surrogate@example.test', 'password': password, 'display_name': 'Synthetic'}
+        # json.dumps in call emits ASCII JSON escapes, not invalid UTF-8 bytes.
+        created = self.expect(201, 'POST', '/auth/signup', account)
+        logged = self.expect(200, 'POST', '/auth/login', {'email': account['email'], 'password': password})
+        self.assertEqual(logged['user_id'], created['user_id'])
+        self.assertEqual(self.expect(200, 'GET', '/reservations', token=logged['token']), {'reservations': []})
+        data = fixture()
+        data['users'][0]['password'] = password
+        self.reset(data)
+        seeded = self.expect(200, 'POST', '/auth/login', {'email': 'a@example.test', 'password': password})
+        self.assertEqual(seeded['user_id'], 'u1')
+        self.expect(401, 'POST', '/auth/login', {'email': 'a@example.test', 'password': chr(0xD801) * 8}, code='unauthenticated')
+
     def test_opaque_restaurant_ids_roundtrip_through_encoded_public_routes(self):
         data = fixture()
         identifiers = ['slash/id', 'percent%2Fid', 'Zoë東京', 'query?fragment#id']
