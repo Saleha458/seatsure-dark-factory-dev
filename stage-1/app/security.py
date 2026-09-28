@@ -10,7 +10,10 @@ PARAMETERS = {"n": 16384, "r": 8, "p": 1, "dklen": 32}
 
 def derive(password, salt):
     with HASH_WORKERS:
-        return hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt), **PARAMETERS).hex()
+        # JSON can represent isolated surrogate code points. Encode them consistently
+        # rather than crashing for an otherwise accepted password string.
+        return hashlib.scrypt(password.encode("utf-8", errors="surrogatepass"),
+                              salt=bytes.fromhex(salt), **PARAMETERS).hex()
 
 
 def hash_password(password):
