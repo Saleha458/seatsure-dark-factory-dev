@@ -350,6 +350,46 @@ class Contracts(unittest.TestCase):
         self.assertEqual(logged['display_name'], body['display_name'])
         self.expect(422, 'POST', '/auth/signup', dict(body, email='short@example.test', password='é' * 7), code='validation_failed')
 
+    def test_opaque_restaurant_ids_roundtrip_through_encoded_public_routes(self):
+        data = fixture()
+        identifiers = ['slash/id', 'percent%2Fid', 'Zoë東京', 'query?fragment#id']
+        template = data['restaurants'][0]
+        data['restaurants'] = [dict(copy.deepcopy(template), id=rid) for rid in identifiers]
+        self.reset(data)
+        self.assertEqual([r['id'] for r in self.expect(200, 'GET', '/restaurants')['restaurants']], identifiers)
+        for rid, expected in zip(identifiers, data['restaurants']):
+            with self.subTest(identifier=rid):
+                encoded = urllib.parse.quote(rid, safe='')
+                self.assertEqual(self.expect(200, 'GET', '/restaurants/' + encoded), expected)
+                query = urllib.parse.urlencode({'restaurant_id': rid, 'date': '2035-09-24', 'party_size': '2'})
+                self.assertEqual(self.expect(200, 'GET', '/availability?' + query)['restaurant_id'], rid)
+
+    def test_historical_booking_uses_rfc3339_and_its_export_replays_unchanged(self):
+        original = self.create(starts_at_local='1800-01-01T18:00')
+        exported = self.snapshot()
+        # Import portability is checked before formatting so both defects are observable.
+        with self.subTest(contract='own export is importable'):
+            self.expect(204, 'POST', '/_test/import', exported)
+            self.assertEqual(self.expect(200, 'POST', '/reservations', self.body(starts_at_local='1800-01-01T18:00'), token=self.token, key='create'), original)
+            self.unchanged(exported)
+        with self.subTest(contract='RFC3339 offsets have hour and minute components'):
+            for field in ('starts_at', 'ends_at', 'created_at'):
+                self.assertRegex(original[field], r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$')
+            self.assertEqual((dt.datetime.fromisoformat(original['ends_at']) - dt.datetime.fromisoformat(original['starts_at'])).total_seconds(), 5400)
+
+    def test_arbitrary_decimal_query_values_compare_exactly_with_capacity(self):
+        data = fixture()
+        capacity = 10 ** 101
+        data['restaurants'][0]['tables'] = [{'id': 'huge', 'label': 'Huge', 'capacity': capacity}]
+        self.reset(data)
+        for requested, expected in [(str(capacity - 1), ['huge']), (str(capacity), ['huge']),
+                                    (str(capacity + 1), []), (str(10 ** 102), []),
+                                    ('0' * 101 + '2', ['huge'])]:
+            with self.subTest(decimal_digits=len(requested), expected=expected):
+                slots = self.availability(party=requested)
+                self.assertTrue(slots)
+                self.assertTrue(all(s['available_table_ids'] == expected for s in slots), 'Availability compared a large decimal query incorrectly')
+
     def test_batch_shape_one_eight_nine_and_cross_owner_restaurant(self):
         data = fixture()
         second = copy.deepcopy(data['restaurants'][0]); second['id'] = 'r2'
