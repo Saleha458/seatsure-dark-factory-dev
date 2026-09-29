@@ -63,7 +63,10 @@ class PolicyContracts(unittest.TestCase):
         self.assertEqual(self.call("GET", "/restaurants/r1/policies"),
                          (200, {"policies": []}))
         self.assert_error("GET", "/restaurants/unknown/policies", {}, {}, 404, "not_found")
-        self.assert_error("POST", "/restaurants/unknown/policies", policy(), {}, 404, "not_found")
+        self.assert_error("POST", "/restaurants/unknown/policies", policy(), {}, 401, "unauthenticated")
+        self.assert_error("POST", "/restaurants/unknown/policies", policy(),
+                          {**self.manager, "Idempotency-Key": "unknown"},
+                          404, "not_found")
         self.assert_error("POST", "/restaurants/r1/policies", policy(), {}, 401, "unauthenticated")
         self.assert_error("POST", "/restaurants/r1/policies", policy(), self.diner, 403, "forbidden")
         self.assert_error("POST", "/restaurants/r1/policies", policy(), {

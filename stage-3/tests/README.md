@@ -5,6 +5,7 @@ plus deterministic core-state tests, are:
 
 ```sh
 python -B -m unittest discover -s tests -p 'test_stage3_policies.py' -v
+python -B -m unittest discover -s tests -p 'test_stage3_availability.py' -v
 python -B -m unittest discover -s tests -p 'test_stage2.py' -v
 python -B -m unittest discover -s tests -p 'test_core_*.py' -v
 python -B -m unittest discover -s tests -p 'test_packaging.py' -v

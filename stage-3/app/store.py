@@ -109,8 +109,8 @@ class Store:
         if method == "POST" and len(parts) == 4 and parts[1] == "restaurants" and parts[3] == "policies":
             rid = unquote(parts[2])
             require(0 < len(rid) <= 64)
-            config = reservations.restaurant(state, rid)
             uid = self.authenticate(headers)
+            config = reservations.restaurant(state, rid)
             require(uid in config["manager_user_ids"], 403, "forbidden")
             key = headers.get("Idempotency-Key", "")
             require(key != "", 400, "missing_idempotency_key")

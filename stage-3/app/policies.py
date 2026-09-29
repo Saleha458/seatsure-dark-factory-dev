@@ -68,6 +68,15 @@ def initial(config):
     }
 
 
+def selected(config, local_date):
+    effective = [policy for policy in config["policies"]
+                 if policy["effective_from"] <= local_date]
+    if not effective:
+        return initial(config)
+    return max(effective, key=lambda policy: (policy["effective_from"],
+                                               policy["policy_version"]))
+
+
 def imported(config, raw_policies, raw_version):
     require(type(raw_policies) is list and type(raw_version) is int and raw_version >= 0)
     require(raw_version == len(raw_policies))
