@@ -8,7 +8,7 @@ from .validation import field, identifier, party, require
 
 
 def public(record):
-    result = {key: value for key, value in record.items() if key != "user_id"}
+    result = {key: value for key, value in record.items() if key not in ("user_id", "history")}
     table_ids = members(record)
     result["table_ids"] = table_ids
     if len(table_ids) == 1:
@@ -36,7 +36,7 @@ def restaurant(state, rid):
     return state["restaurants"][rid]
 
 
-def candidate(state, body, current=None):
+def candidate(state, body, current=None, use_policies=True, policy_override=None):
     merged = {} if current is None else dict(current)
     allowed = ("restaurant_id", "table_id", "table_ids", "starts_at_local", "party_size") if current is None else (
         "table_id", "table_ids", "starts_at_local", "party_size")
@@ -68,10 +68,21 @@ def candidate(state, body, current=None):
                      if set(declared) == set(table_ids)), None)
         require(pair is not None, 422, "combination_not_allowed")
         table_ids = list(pair)
-    start, end = interval(config, local)
-    capacity = sum(tables[tid]["capacity"] for tid in table_ids)
+    local_day = local[:10]
+    selected = (policy_override if policy_override is not None else
+                policies.accepted(config, local_day) if use_policies else policies.initial(config))
+    effective = {
+        **config,
+        "slot_minutes": selected["slot_minutes"],
+        "reservation_duration_minutes": selected["reservation_duration_minutes"],
+        "cancellation_cutoff_minutes": selected["cancellation_cutoff_minutes"],
+        "opening_hours": selected["opening_hours"],
+    }
+    start, end = interval(effective, local)
+    capacity = sum(selected["capacities"][tid] for tid in table_ids)
     require(size <= capacity, 422, "party_exceeds_capacity")
-    merged.update(table_ids=list(table_ids), starts_at=start, ends_at=end)
+    merged.update(table_ids=list(table_ids), starts_at_local=local, starts_at=start,
+                  ends_at=end, party_size=size)
     merged.pop("table_id", None)
     return merged
 
@@ -90,16 +101,58 @@ def owned(state, reference, uid):
     return record
 
 
-def check_cutoff(state, record, now):
-    minutes = state["restaurants"][record["restaurant_id"]]["cancellation_cutoff_minutes"]
+def check_cutoff(state, record, now, accepted=True):
+    minutes = (record.get("accepted_terms", {}).get(
+        "cancellation_cutoff_minutes",
+        state["restaurants"][record["restaurant_id"]]["cancellation_cutoff_minutes"])
+        if accepted else state["restaurants"][record["restaurant_id"]]["cancellation_cutoff_minutes"])
     require((instant(record["starts_at"]) - now).total_seconds() > minutes * 60,
             409, "cutoff_passed")
 
 
-def amendment(state, record, changes, now):
+def unchanged_request(record, changes):
+    if "table_id" in changes and "table_ids" in changes:
+        return False
+    ids = members(record)
+    if "table_id" in changes:
+        if type(changes["table_id"]) is not str or ids != [changes["table_id"]]:
+            return False
+    if "table_ids" in changes:
+        requested = changes["table_ids"]
+        if (type(requested) is not list or len(requested) != len(ids)
+                or any(type(table_id) is not str for table_id in requested)
+                or len(set(requested)) != len(requested)
+                or set(requested) != set(ids)):
+            return False
+    if "starts_at_local" in changes and (
+            type(changes["starts_at_local"]) is not str
+            or changes["starts_at_local"] != record["starts_at_local"]):
+        return False
+    if "party_size" in changes and (
+            type(changes["party_size"]) is not int
+            or changes["party_size"] != record["party_size"]):
+        return False
+    return True
+
+
+def amendment(state, record, changes, now, stage3=True):
     require(record["status"] != "cancelled", 409, "reservation_cancelled")
-    check_cutoff(state, record, now)
-    return candidate(state, changes, record)
+    expected = changes.get("expected_revision")
+    if stage3 and "expected_revision" in changes:
+        require(type(expected) is int and expected >= 1)
+        require(expected == record.get("revision", 1), 409, "stale_revision")
+    check_cutoff(state, record, now, accepted=stage3)
+    if stage3 and unchanged_request(record, changes):
+        candidate(state, changes, record, use_policies=False,
+                  policy_override=record["accepted_terms"])
+        return record
+    proposed = candidate(state, changes, record, use_policies=stage3)
+    if not stage3:
+        return proposed
+    selected = policies.accepted(state["restaurants"][record["restaurant_id"]],
+                                 proposed["starts_at_local"][:10])
+    proposed.update(revision=record.get("revision", 1), accepted_terms=selected)
+    return proposed
 
 
 def moves(state, body, uid, now):
@@ -112,7 +165,7 @@ def moves(state, body, uid, now):
     for item in items:
         record = owned(state, item["reference"], uid)
         require(not proposed or record["restaurant_id"] == proposed[0]["restaurant_id"])
-        proposed.append(amendment(state, record, item, now))
+        proposed.append(amendment(state, record, item, now, stage3=False))
     check_occupancy(state, proposed, {r["reservation_id"] for r in proposed})
     return proposed
 

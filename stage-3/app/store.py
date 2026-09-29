@@ -66,6 +66,27 @@ class Store:
         require(uid is not None, 401, "unauthenticated")
         return uid
 
+    def history_owner(self, reference, headers):
+        value = headers.get("Authorization", "")
+        match = re.fullmatch(r"Bearer ([A-Za-z0-9_-]+)", value, re.IGNORECASE)
+        uid = self.state["tokens"].get(match[1]) if match else None
+        record = next((item for item in self.state["reservations"].values()
+                       if item["reference"] == reference), None)
+        require(uid is not None and record is not None and record["user_id"] == uid,
+                404, "not_found")
+        return record
+
+    @staticmethod
+    def append_history(record, event, changes, at):
+        entries = record.setdefault("history", [])
+        if entries:
+            previous = instant(entries[-1]["at"])
+            if at < previous:
+                at = previous
+        entries.append(transfer.history_entry(
+            len(entries) + 1, at.isoformat(), event, changes,
+            record["revision"], record["accepted_terms"]))
+
     def dispatch(self, method, path, query, body, headers):
         if method == "POST" and path == "/_test/reset":
             self.replace(transfer.fixture(body))
@@ -106,6 +127,15 @@ class Store:
             if path == "/availability":
                 return 200, reservations.availability(state, query)
         parts = path.split("/")
+        if method == "GET" and len(parts) == 4 and parts[1] == "reservations" \
+                and parts[3] in ("history", "decision"):
+            record = self.history_owner(unquote(parts[2]), headers)
+            if parts[3] == "history":
+                return 200, {"reference": record["reference"],
+                             "entries": record.get("history", [])}
+            return 200, {"reference": record["reference"],
+                         "revision": record["revision"],
+                         "accepted_terms": record["accepted_terms"]}
         if method == "POST" and len(parts) == 4 and parts[1] == "restaurants" and parts[3] == "policies":
             rid = unquote(parts[2])
             require(0 < len(rid) <= 64)
@@ -151,7 +181,13 @@ class Store:
                 while reference in references:
                     reference = secrets.token_hex(5).upper()
                 record.update(reservation_id=uuid4().hex, reference=reference, user_id=uid,
-                              status="confirmed", created_at=now.isoformat())
+                              status="confirmed", created_at=now.isoformat(), revision=1,
+                              accepted_terms=policies.accepted(
+                                  state["restaurants"][record["restaurant_id"]],
+                                  record["starts_at_local"][:10]))
+                record["history"] = [transfer.history_entry(
+                    1, record["created_at"], "created",
+                    transfer.create_changes(record), 1, record["accepted_terms"])]
                 proposed = [record]
                 response = reservations.public(record)
             else:
@@ -174,13 +210,42 @@ class Store:
                 return 200, reservations.public(record)
             if method == "POST" and len(parts) == 4 and parts[3] == "cancel":
                 if record["status"] != "cancelled":
-                    reservations.check_cutoff(state, record, datetime.now(UTC))
-                    record = {**record, "status": "cancelled"}
+                    now = datetime.now(UTC)
+                    reservations.check_cutoff(state, record, now)
+                    record = {**record, "status": "cancelled",
+                              "revision": record.get("revision", 1) + 1}
+                    self.append_history(record, "cancelled", [], now)
                     state["reservations"][record["reservation_id"]] = record
                 return 200, reservations.public(record)
             if method == "PATCH" and len(parts) == 3:
-                proposed = reservations.amendment(state, record, body, datetime.now(UTC))
+                now = datetime.now(UTC)
+                proposed = reservations.amendment(state, record, body, now)
+                changed = []
+                before_tables = reservations.members(record)
+                after_tables = reservations.members(proposed)
+                if before_tables != after_tables:
+                    if len(before_tables) == len(after_tables) == 1:
+                        changed.append({"field": "table_id", "from": before_tables[0],
+                                        "to": after_tables[0]})
+                    else:
+                        changed.append({"field": "table_ids", "from": before_tables,
+                                        "to": after_tables})
+                if record["starts_at_local"] != proposed["starts_at_local"]:
+                    changed.append({"field": "starts_at_local",
+                                    "from": record["starts_at_local"],
+                                    "to": proposed["starts_at_local"]})
+                if record["party_size"] != proposed["party_size"]:
+                    changed.append({"field": "party_size", "from": record["party_size"],
+                                    "to": proposed["party_size"]})
+                if not changed:
+                    return 200, reservations.public(record)
                 reservations.check_occupancy(state, [proposed], {record["reservation_id"]})
+                proposed["revision"] = record.get("revision", 1) + 1
+                proposed["accepted_terms"] = policies.accepted(
+                    state["restaurants"][record["restaurant_id"]],
+                    proposed["starts_at_local"][:10])
+                proposed["history"] = deepcopy(record.get("history", []))
+                self.append_history(proposed, "changed", changed, now)
                 state["reservations"][record["reservation_id"]] = proposed
                 return 200, reservations.public(proposed)
         require(False, 404, "not_found")

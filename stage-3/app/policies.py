@@ -77,6 +77,11 @@ def selected(config, local_date):
                                                policy["policy_version"]))
 
 
+def accepted(config, local_date):
+    current = selected(config, local_date)
+    return {key: value for key, value in current.items() if key != "effective_from"}
+
+
 def imported(config, raw_policies, raw_version):
     require(type(raw_policies) is list and type(raw_version) is int and raw_version >= 0)
     require(raw_version == len(raw_policies))

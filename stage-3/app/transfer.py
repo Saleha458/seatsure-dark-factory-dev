@@ -107,6 +107,9 @@ def fixture(body):
         require(status in ("confirmed", "cancelled"))
         record.update(reservation_id=rid, reference=reference, user_id=uid,
                       status=status, created_at=datetime.now(UTC).isoformat())
+        record.update(revision=1, accepted_terms=policies.initial(state["restaurants"][record["restaurant_id"]]))
+        record["history"] = [history_entry(
+            1, record["created_at"], "created", create_changes(record), 1, record["accepted_terms"])]
         if status == "confirmed":
             check_occupancy(state, [record])
         state["reservations"][rid] = record
@@ -137,7 +140,32 @@ def validate_record(state, raw, historical=False):
         candidate_raw.pop("table_id")
         require(type(raw["table_ids"]) is list and len(raw["table_ids"]) == 1
                 and raw["table_id"] == raw["table_ids"][0])
-    expected = candidate(state, candidate_raw)
+    terms = raw.get("accepted_terms")
+    config = state["restaurants"].get(raw.get("restaurant_id"))
+    require(config is not None)
+    if type(terms) is dict:
+        capacities = terms.get("capacities")
+        require(type(capacities) is dict and set(capacities) == {t["id"] for t in config["tables"]})
+        override = {
+            "policy_version": terms.get("policy_version"),
+            "slot_minutes": terms.get("slot_minutes"),
+            "reservation_duration_minutes": terms.get("reservation_duration_minutes"),
+            "cancellation_cutoff_minutes": terms.get("cancellation_cutoff_minutes"),
+            "opening_hours": terms.get("opening_hours"),
+            "capacities": capacities,
+        }
+        require(type(override["policy_version"]) is int and override["policy_version"] >= 0)
+        require(type(override["slot_minutes"]) is int and 1 <= override["slot_minutes"] <= 1440)
+        require(type(override["reservation_duration_minutes"]) is int
+                and 1 <= override["reservation_duration_minutes"] <= 1440)
+        require(type(override["cancellation_cutoff_minutes"]) is int
+                and 0 <= override["cancellation_cutoff_minutes"] <= 10080)
+        require(type(override["opening_hours"]) is list)
+        require(all(type(cap) is int and 1 <= cap <= 100 for cap in capacities.values()))
+        config_for_candidate = override
+        expected = candidate(state, candidate_raw, use_policies=False, policy_override=config_for_candidate)
+    else:
+        expected = candidate(state, candidate_raw, use_policies=False)
     require(raw["starts_at"] == expected["starts_at"] and raw["ends_at"] == expected["ends_at"])
     if "table_ids" in raw:
         require(raw["table_ids"] == expected["table_ids"])
@@ -145,7 +173,85 @@ def validate_record(state, raw, historical=False):
         require(raw.get("table_id") == expected["table_ids"][0] and len(expected["table_ids"]) == 1)
     if not historical:
         require(identifier(raw, "user_id") in state["users"])
+    revision = raw.get("revision", 1)
+    require(type(revision) is int and revision >= 1)
+    if terms is not None:
+        require(set(terms) == {"policy_version", "slot_minutes", "reservation_duration_minutes",
+                               "cancellation_cutoff_minutes", "opening_hours", "capacities"})
+    if "history" in raw:
+        validate_history(raw, revision, terms)
     return raw
+
+
+def with_legacy_terms(state, raw):
+    record = deepcopy(raw)
+    config = state["restaurants"][record["restaurant_id"]]
+    terms = record.get("accepted_terms", policies.initial(config))
+    record.setdefault("revision", 1)
+    record["accepted_terms"] = terms
+    record.setdefault("history", [history_entry(
+        1, record["created_at"], "created", create_changes(record), 1, terms)])
+    validate_history(record, record["revision"], terms)
+    return record
+
+
+def create_changes(record):
+    if len(record["table_ids"]) == 1:
+        table_change = {"field": "table_id", "from": None, "to": record["table_ids"][0]}
+    else:
+        table_change = {"field": "table_ids", "from": None, "to": list(record["table_ids"])}
+    return [table_change,
+            {"field": "starts_at_local", "from": None, "to": record["starts_at_local"]},
+            {"field": "party_size", "from": None, "to": record["party_size"]}]
+
+
+def history_entry(seq, at, event, changes, revision, accepted_terms):
+    return {"seq": seq, "at": at, "event": event, "changes": deepcopy(changes),
+            "revision": revision, "accepted_terms": deepcopy(accepted_terms)}
+
+
+def validate_history(record, revision, terms):
+    entries = record["history"]
+    require(type(entries) is list and len(entries) >= 1)
+    require(len(entries) == revision)
+    previous_at = None
+    for index, entry in enumerate(entries, 1):
+        require(type(entry) is dict and entry.get("seq") == index)
+        timestamp(entry.get("at"))
+        require(entry.get("event") in ("created", "changed", "cancelled"))
+        require(index == 1 or entry.get("event") in ("changed", "cancelled"))
+        require(index != 1 or entry.get("event") == "created")
+        require(type(entry.get("changes")) is list)
+        require(type(entry.get("revision")) is int and entry["revision"] == index)
+        require(type(entry.get("accepted_terms")) is dict)
+        if entry["event"] == "cancelled":
+            require(entry["changes"] == [] and index == len(entries)
+                    and record.get("status") == "cancelled")
+        elif entry["event"] == "changed":
+            changes = entry["changes"]
+            fields = [change.get("field") for change in changes if type(change) is dict]
+            require(len(fields) == len(changes) and fields)
+            ranks = {"table_id": 0, "table_ids": 0, "starts_at_local": 1, "party_size": 2}
+            require(all(field_name in ranks for field_name in fields))
+            require(not ("table_id" in fields and "table_ids" in fields))
+            require(fields == sorted(fields, key=ranks.__getitem__))
+            require(len(set(fields)) == len(fields))
+            require(all(set(change) == {"field", "from", "to"} for change in changes))
+        else:
+            changes = entry["changes"]
+            fields = [change.get("field") for change in changes if type(change) is dict]
+            require(len(fields) == 3 and len(fields) == len(changes))
+            require(fields in (["table_id", "starts_at_local", "party_size"],
+                               ["table_ids", "starts_at_local", "party_size"]))
+            require(all(change.get("from") is None
+                        and set(change) == {"field", "from", "to"} for change in changes))
+        if index > 1:
+            require(entries[index - 2].get("event") != "cancelled")
+        if previous_at is not None:
+            require(timestamp(entry["at"]) >= previous_at)
+        previous_at = timestamp(entry["at"])
+    if terms is not None:
+        require(entries[-1]["accepted_terms"] == terms)
 
 
 def import_state(envelope):
@@ -186,6 +292,7 @@ def import_state(envelope):
         for rid, record in raw["reservations"].items():
             validate_record(state, record)
             require(record["reservation_id"] == rid and record["reference"] not in references)
+            record = with_legacy_terms(state, record)
             if record["status"] == "confirmed":
                 check_occupancy(state, [record])
             state["reservations"][rid] = deepcopy(record)
@@ -222,7 +329,8 @@ def import_state(envelope):
                 historical = []
             elif path == "/reservations":
                 historical = [response]
-                expected = candidate(state, request)
+                expected = candidate(state, request, use_policies=False,
+                                     policy_override=response.get("accepted_terms"))
                 for key, value in expected.items():
                     if key == "table_ids" and key not in response:
                         require(len(value) == 1 and response.get("table_id") == value[0])
@@ -239,7 +347,7 @@ def import_state(envelope):
                 require(all(type(r) is dict and r.get("reference") == item["reference"]
                             for r, item in zip(historical, items)))
                 for record, item in zip(historical, items):
-                    expected = candidate(state, item, record)
+                    expected = candidate(state, item, record, use_policies=False)
                     for key in ("starts_at_local", "party_size"):
                         if key in item:
                             require(record.get(key) == expected[key])
