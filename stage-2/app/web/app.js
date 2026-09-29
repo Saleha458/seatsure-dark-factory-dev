@@ -133,7 +133,7 @@
         restaurantId: activeSearch.context.restaurantId,
         config: activeSearch.config,
         start: slot.starts_at_local,
-        tableIds: button.dataset.ids.split("|"),
+        tableIds: JSON.parse(button.dataset.ids),
         partySize: activeSearch.context.partySize
       };
       bookingPartyInput = String(selection.partySize);
@@ -219,7 +219,7 @@
     const pairKey = ids.length === 2 ? `${ids[0]}+${ids[1]}` : ids[0];
     const testId = `slot-${pairKey}-${timeLabel(starts)}`;
     const text = ids.length === 2 ? `${label.replace(" + ", " & ")} together` : label;
-    return `<button type="button" class="seat-choice ${available ? "" : "unavailable"}" data-testid="${escapeHtml(testId)}" data-option="${escapeHtml(pairKey)}" data-ids="${escapeHtml(ids.join("|"))}" data-starts="${escapeHtml(starts)}" data-available="${available}" ${available ? "" : "aria-disabled=\"true\""}><span class="seat-label">${escapeHtml(text)}</span><span class="seat-meta">${available ? `Seats up to ${capacity}` : "Unavailable"}</span></button>`;
+    return `<button type="button" class="seat-choice ${available ? "" : "unavailable"}" data-testid="${escapeHtml(testId)}" data-option="${escapeHtml(pairKey)}" data-ids="${escapeHtml(JSON.stringify(ids))}" data-starts="${escapeHtml(starts)}" data-available="${available}" ${available ? "" : "aria-disabled=\"true\""}><span class="seat-label">${escapeHtml(text)}</span><span class="seat-meta">${available ? `Seats up to ${capacity}` : "Unavailable"}</span></button>`;
   }
   function renderBooking() {
     if (!selection) return;

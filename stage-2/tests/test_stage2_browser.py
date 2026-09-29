@@ -88,7 +88,14 @@ class Stage2BrowserFlows(unittest.TestCase):
         edge_process = None
         try:
             base = f"http://127.0.0.1:{port}"
-            http_call(base, "POST", "/_test/reset", combined_fixture())
+            fixture = combined_fixture()
+            fixture["restaurants"][0]["tables"].extend([
+                {"id": "opaque|single", "label": "Pipe Single", "capacity": 2},
+                {"id": "opaque|left", "label": "Pipe Left", "capacity": 2},
+                {"id": "opaque|right", "label": "Pipe Right", "capacity": 2},
+            ])
+            fixture["restaurants"][0]["combinable"].append(["opaque|left", "opaque|right"])
+            http_call(base, "POST", "/_test/reset", fixture)
             debug_port = free_port()
             edge_process = subprocess.Popen([
                 EDGE, "--headless=new", "--disable-gpu", "--disable-background-networking",
@@ -317,6 +324,34 @@ class Stage2BrowserFlows(unittest.TestCase):
             self.assertEqual(pair_replay.get("status"), 200)
             self.assertEqual(browser.evaluate("document.querySelector('[data-testid=confirmation-reference]').textContent"),
                              pair_reference)
+
+            browser.evaluate("""
+              document.querySelector('[data-testid=party-size-input]').value='2';
+              document.querySelector('#search-form').requestSubmit();
+            """)
+            browser.wait("document.querySelector('[data-testid=availability-grid] [data-option=\"opaque|single\"]') !== null")
+            browser.evaluate("document.querySelector('[data-testid=availability-grid] [data-option=\"opaque|single\"]').click()")
+            browser.evaluate("document.querySelector('[data-testid=booking-submit]').click()")
+            browser.wait("!!document.querySelector('[data-testid=confirmation-reference]')")
+            opaque_single = browser.evaluate("window.__requests.at(-1)")
+            self.assertEqual(json.loads(opaque_single["body"])["table_id"], "opaque|single")
+            opaque_single_reference = browser.evaluate(
+                "document.querySelector('[data-testid=confirmation-reference]').textContent")
+
+            browser.evaluate("""
+              document.querySelector('[data-testid=party-size-input]').value='3';
+              document.querySelector('#search-form').requestSubmit();
+            """)
+            browser.wait("document.querySelector('[data-testid=availability-grid] [data-option=\"opaque|left+opaque|right\"]') !== null")
+            browser.evaluate("document.querySelector('[data-testid=availability-grid] [data-option=\"opaque|left+opaque|right\"]').click()")
+            browser.evaluate("document.querySelector('[data-testid=booking-submit]').click()")
+            browser.wait("!!document.querySelector('[data-testid=confirmation-reference]')")
+            opaque_pair = browser.evaluate("window.__requests.at(-1)")
+            self.assertEqual(json.loads(opaque_pair["body"])["table_ids"],
+                             ["opaque|left", "opaque|right"])
+            opaque_pair_reference = browser.evaluate(
+                "document.querySelector('[data-testid=confirmation-reference]').textContent")
+            self.assertNotEqual(opaque_single_reference, opaque_pair_reference)
 
             browser.call("Page.navigate", {"url": base + "/lookup"})
             browser.wait("location.pathname === '/lookup' && !!document.querySelector('[data-testid=lookup-submit]')")
