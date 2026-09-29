@@ -108,6 +108,25 @@ class PolicyAvailabilityContracts(unittest.TestCase):
         self.assertTrue(all(item["policy_version"] == 1
                             for item in selected_later["slots"][0]["explain"]))
 
+    def test_policy_grid_steps_differing_from_fixture_grid(self):
+        self.publish(policy("2035-09-24", opens="18:00", closes="21:00",
+                            slot=60, duration=30), "policy-grid-60")
+        larger = self.availability("2035-09-24")
+        self.assertEqual(
+            [slot["starts_at_local"] for slot in larger["slots"]],
+            ["2035-09-24T18:00", "2035-09-24T19:00", "2035-09-24T20:00"])
+
+        self.setUp()
+        self.publish(policy("2035-09-24", opens="18:00", closes="21:00",
+                            slot=15, duration=15), "policy-grid-15")
+        smaller = self.availability("2035-09-24")
+        self.assertEqual(
+            [slot["starts_at_local"] for slot in smaller["slots"]],
+            ["2035-09-24T18:00", "2035-09-24T18:15", "2035-09-24T18:30",
+             "2035-09-24T18:45", "2035-09-24T19:00", "2035-09-24T19:15",
+             "2035-09-24T19:30", "2035-09-24T19:45", "2035-09-24T20:00",
+             "2035-09-24T20:15", "2035-09-24T20:30", "2035-09-24T20:45"])
+
     def test_policy_capacity_combines_declared_pairs_and_explain_matches_available(self):
         self.publish(policy("2035-09-26", capacities={"t1": 2, "t2": 5, "t3": 6}),
                      "capacity-change")
