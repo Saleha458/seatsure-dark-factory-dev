@@ -15,6 +15,8 @@
   let pendingBooking = null;
   let lastConfirmation = null;
   let searchContext = null;
+  let bookingError = null;
+  let bookingPartyInput = "";
 
   const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -134,8 +136,10 @@
         tableIds: button.dataset.ids.split("|"),
         partySize: activeSearch.context.partySize
       };
+      bookingPartyInput = String(selection.partySize);
       pendingBooking = null;
       lastConfirmation = null;
+      bookingError = null;
       root.querySelector("#search-feedback").innerHTML = "";
       renderBooking();
       root.querySelector("#booking-form")?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -228,17 +232,20 @@
         <p class="booking-summary" data-testid="booking-summary">${escapeHtml(summary)}</p>
         <form data-testid="booking-form" id="booking-form">
           <div class="booking-fields">
-            <div class="field"><label for="booking-party-size">Party size</label><input id="booking-party-size" data-testid="booking-party-size" type="number" min="1" step="1" required value="${partySize}"></div>
+            <div class="field"><label for="booking-party-size">Party size</label><input id="booking-party-size" data-testid="booking-party-size" type="number" min="1" step="1" required value="${escapeHtml(bookingPartyInput)}"></div>
             <button class="button" data-testid="booking-submit" type="submit">Confirm reservation</button>
           </div>
-          <div id="booking-feedback">${lastConfirmation ? "" : ""}</div>
+          <div id="booking-feedback">${bookingError ? feedback("booking-error", bookingError, "error") : ""}</div>
           ${pendingBooking?.uncertain ? feedback("booking-uncertain", "We couldn’t confirm whether the reservation was received. Your request is saved; retry without changing it to check the original booking.", "notice") : ""}
           ${confirmation}
         </form>
       </section>`;
-    root.querySelector("#booking-party-size").addEventListener("input", () => {
+    root.querySelector("#booking-party-size").addEventListener("input", (event) => {
+      bookingPartyInput = event.currentTarget.value;
+      selection.partySize = Number(bookingPartyInput);
       pendingBooking = null;
       lastConfirmation = null;
+      bookingError = null;
       root.querySelector("#booking-feedback").innerHTML = "";
       root.querySelector('[data-testid="booking-uncertain"]')?.remove();
       root.querySelector('[data-testid="confirmation"]')?.remove();
@@ -267,13 +274,15 @@
     if (!selection || !session) return;
     const body = bookingBody();
     if (!Number.isInteger(body.party_size) || body.party_size < 1) {
-      root.querySelector("#booking-feedback").innerHTML = feedback("booking-error", "Party size must be at least one.", "error");
+      bookingError = "Party size must be at least one.";
+      root.querySelector("#booking-feedback").innerHTML = feedback("booking-error", bookingError, "error");
       return;
     }
     const serialized = JSON.stringify(body);
     if (!pendingBooking || pendingBooking.serialized !== serialized) {
       pendingBooking = { body, serialized, key: crypto.randomUUID(), uncertain: false };
       lastConfirmation = null;
+      bookingError = null;
     }
     const pending = pendingBooking;
     const button = root.querySelector('[data-testid="booking-submit"]');
@@ -290,6 +299,7 @@
         if (!result.payload || typeof result.payload.reference !== "string") throw new Error("The response was incomplete.");
         pending.uncertain = false;
         lastConfirmation = result.payload;
+        bookingError = null;
         renderBooking();
         return;
       }
@@ -297,15 +307,18 @@
       root.querySelector('[data-testid="booking-uncertain"]')?.remove();
       const message = apiError(result);
       if (result.response.status === 409 && result.payload?.error?.code === "table_unavailable") {
-        root.querySelector("#booking-feedback").innerHTML = feedback("booking-error", "That table was just taken. Your choices are still here; please select another time or table.", "error");
+        bookingError = "That table was just taken. Your choices are still here; please select another time or table.";
+        root.querySelector("#booking-feedback").innerHTML = feedback("booking-error", bookingError, "error");
         const context = searchContext;
         if (context) runSearch({ context, preserveSelection: true });
       } else {
-        root.querySelector("#booking-feedback").innerHTML = feedback("booking-error", message, "error");
+        bookingError = message;
+        root.querySelector("#booking-feedback").innerHTML = feedback("booking-error", bookingError, "error");
       }
     } catch {
       pending.uncertain = true;
       lastConfirmation = null;
+      bookingError = null;
       root.querySelector("#booking-feedback").innerHTML = "";
       root.querySelector('[data-testid="confirmation"]')?.remove();
       root.querySelector('[data-testid="booking-uncertain"]')?.remove();

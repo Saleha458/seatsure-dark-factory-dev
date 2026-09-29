@@ -112,7 +112,6 @@ class Stage2BrowserFlows(unittest.TestCase):
             with urllib.request.urlopen(f"http://127.0.0.1:{debug_port}/json/version", timeout=2) as response:
                 browser_info = json.loads(response.read())
             browser = DevToolsPage(browser_info["webSocketDebuggerUrl"], target["id"])
-            browser.call("Runtime.enable")
             browser.call("Emulation.setDeviceMetricsOverride", {
                 "width": 375, "height": 812, "deviceScaleFactor": 1, "mobile": False,
             })
@@ -142,6 +141,11 @@ class Stage2BrowserFlows(unittest.TestCase):
                       throw new TypeError("simulated lost request");
                     }
                     const response = await nativeFetch(input, init);
+                    item.status = response.status;
+                    if (!response.ok) {
+                      const payload = await response.clone().json();
+                      item.errorCode = payload?.error?.code;
+                    }
                     if (window.__faultMode === "after") {
                       window.__faultMode = "";
                       throw new TypeError("simulated lost response");
@@ -191,12 +195,19 @@ class Stage2BrowserFlows(unittest.TestCase):
                 "Authorization": "Bearer " + token, "Idempotency-Key": "browser-external-conflict"
             })
             self.assertEqual(status, 201)
+            refresh_count = browser.evaluate("window.__availabilityStarted.length")
             browser.evaluate("document.querySelector('[data-testid=booking-submit]').click()")
             browser.wait("!!document.querySelector('[data-testid=booking-error]')")
+            self.assertEqual(browser.evaluate("window.__requests.at(-1).errorCode"), "table_unavailable")
             self.assertTrue(browser.evaluate("!!document.querySelector('[data-testid=booking-form]')"))
             self.assertEqual(browser.evaluate("document.querySelector('[data-testid=booking-party-size]').value"), "6")
             self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=confirmation]')"))
             browser.wait("document.querySelector('[data-testid=\"slot-t1+t2-18:00\"]') === null")
+            browser.wait(f"window.__availabilityStarted.length > {refresh_count}")
+            browser.wait("document.querySelector('[data-testid=availability-grid]') !== null && "
+                         "document.querySelector('#search-results').getAttribute('aria-busy') === 'false'")
+            self.assertTrue(browser.evaluate("!!document.querySelector('[data-testid=booking-error]')"))
+            self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=booking-uncertain]')"))
 
             browser.evaluate("""
               document.querySelector('[data-testid=party-size-input]').value='2';
@@ -205,18 +216,71 @@ class Stage2BrowserFlows(unittest.TestCase):
             """)
             browser.wait("document.querySelector('[data-testid=\"slot-t3-21:00\"]') !== null")
             browser.evaluate("document.querySelector('[data-testid=\"slot-t3-21:00\"]').click()")
-            browser.evaluate("window.__faultMode='before'; document.querySelector('[data-testid=booking-submit]').click()")
+            browser.evaluate("""
+              const party = document.querySelector('[data-testid=booking-party-size]');
+              party.value='3';
+              party.dispatchEvent(new Event('input', {bubbles:true}));
+              document.querySelector('[data-testid=booking-submit]').click();
+            """)
+            browser.wait("!!document.querySelector('[data-testid=booking-error]')")
+            browser.wait("!document.querySelector('[data-testid=booking-submit]').disabled")
+            self.assertEqual(browser.evaluate("window.__requests.at(-1).errorCode"), "party_exceeds_capacity")
+            self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=booking-uncertain]')"))
+            self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=confirmation]')"))
+            rejected_request = browser.evaluate("window.__requests.at(-1)")
+            self.assertEqual(json.loads(rejected_request["body"])["party_size"], 3)
+            updated_party = browser.evaluate("""(() => {
+              const input = document.querySelector('[data-testid=booking-party-size]');
+              input.value='2';
+              input.dispatchEvent(new Event('input', {bubbles:true}));
+              return {
+                value:input.value,
+                error:!!document.querySelector('[data-testid=booking-error]'),
+                disabled:document.querySelector('[data-testid=booking-submit]').disabled
+              };
+            })()""")
+            self.assertEqual(updated_party, {"value": "2", "error": False, "disabled": False})
+            browser.evaluate("window.__faultMode='before'")
+            browser.evaluate("document.querySelector('[data-testid=booking-submit]').click()")
             browser.wait("!!document.querySelector('[data-testid=booking-uncertain]')")
+            self.assertTrue(browser.evaluate(
+                "document.querySelector('[data-testid=booking-uncertain]').textContent.trim().length > 0"))
             self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=booking-error]')"))
             self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=confirmation]')"))
+            first_attempt = browser.evaluate("window.__requests.at(-1)")
+            self.assertNotEqual(first_attempt["key"], rejected_request["key"])
+            self.assertEqual(json.loads(first_attempt["body"])["party_size"], 2)
             browser.evaluate("document.querySelector('[data-testid=booking-submit]').click()")
             browser.wait("!!document.querySelector('[data-testid=confirmation-reference]')")
             single_reference = browser.evaluate("document.querySelector('[data-testid=confirmation-reference]').textContent")
+            self.assertRegex(single_reference, r"^[A-Z0-9]{6,12}$")
+            single_details = browser.evaluate("document.querySelector('[data-testid=confirmation-details]').textContent")
+            self.assertIn("Example", single_details)
+            self.assertIn("Table Window nook", single_details)
+            self.assertIn("2035-09-25 at 21:00", single_details)
             requests = browser.evaluate("window.__requests.slice(-2)")
             self.assertEqual(len(requests), 2)
-            self.assertEqual(requests[0], requests[1])
+            self.assertEqual((requests[0]["key"], requests[0]["body"]),
+                             (requests[1]["key"], requests[1]["body"]))
             self.assertEqual(json.loads(requests[0]["body"])["table_id"], "t3")
+            self.assertIsNone(first_attempt.get("status"))
+            self.assertEqual(requests[1].get("status"), 201)
             self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=booking-uncertain]')"))
+            browser.evaluate("document.querySelector('[data-testid=booking-submit]').click()")
+            browser.wait("window.__requests.length >= 4 && !document.querySelector('[data-testid=booking-submit]').disabled")
+            replayed_reference = browser.evaluate("document.querySelector('[data-testid=confirmation-reference]').textContent")
+            replay = browser.evaluate("window.__requests.at(-1)")
+            self.assertEqual(replayed_reference, single_reference)
+            self.assertEqual((replay["key"], replay["body"]),
+                             (first_attempt["key"], first_attempt["body"]))
+            self.assertEqual(replay.get("status"), 200)
+            self.assertEqual(browser.evaluate("""(async () => {
+              const response = await fetch('/reservations', {
+                headers: {Authorization: 'Bearer ' + JSON.parse(localStorage.getItem('tablekeeper-session')).token}
+              });
+              const data = await response.json();
+              return data.reservations.filter(item => item.reference === %s).length;
+            })()""" % json.dumps(single_reference)), 1)
 
             browser.evaluate("""
               document.querySelector('[data-testid=party-size-input]').value='6';
@@ -226,16 +290,33 @@ class Stage2BrowserFlows(unittest.TestCase):
             browser.evaluate("document.querySelector('[data-testid=\"slot-t1+t2-21:00\"]').click()")
             browser.evaluate("window.__faultMode='after'; document.querySelector('[data-testid=booking-submit]').click()")
             browser.wait("!!document.querySelector('[data-testid=booking-uncertain]')")
+            self.assertTrue(browser.evaluate(
+                "document.querySelector('[data-testid=booking-uncertain]').textContent.trim().length > 0"))
+            self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=booking-error]')"))
             self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=confirmation]')"))
             browser.evaluate("document.querySelector('[data-testid=booking-submit]').click()")
             browser.wait("!!document.querySelector('[data-testid=confirmation-reference]')")
             pair_reference = browser.evaluate("document.querySelector('[data-testid=confirmation-reference]').textContent")
             requests = browser.evaluate("window.__requests.slice(-2)")
-            self.assertEqual(requests[0], requests[1])
+            self.assertEqual((requests[0]["key"], requests[0]["body"]),
+                             (requests[1]["key"], requests[1]["body"]))
             self.assertEqual(json.loads(requests[0]["body"])["table_ids"], ["t1", "t2"])
+            self.assertEqual(requests[0].get("status"), 201)
+            self.assertEqual(requests[1].get("status"), 200)
             self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=booking-uncertain]')"))
             self.assertFalse(browser.evaluate("!!document.querySelector('[data-testid=booking-error]')"))
             self.assertTrue(browser.evaluate("!!document.querySelector('[data-testid=confirmation-tables]')"))
+            pair_labels = browser.evaluate("document.querySelector('[data-testid=confirmation-tables]').textContent")
+            self.assertIn("Table 1", pair_labels)
+            self.assertIn("Table 2", pair_labels)
+            browser.evaluate("document.querySelector('[data-testid=booking-submit]').click()")
+            browser.wait("window.__requests.length >= 7 && !document.querySelector('[data-testid=booking-submit]').disabled")
+            pair_replay = browser.evaluate("window.__requests.at(-1)")
+            self.assertEqual((pair_replay["key"], pair_replay["body"]),
+                             (requests[1]["key"], requests[1]["body"]))
+            self.assertEqual(pair_replay.get("status"), 200)
+            self.assertEqual(browser.evaluate("document.querySelector('[data-testid=confirmation-reference]').textContent"),
+                             pair_reference)
 
             browser.call("Page.navigate", {"url": base + "/lookup"})
             browser.wait("location.pathname === '/lookup' && !!document.querySelector('[data-testid=lookup-submit]')")
