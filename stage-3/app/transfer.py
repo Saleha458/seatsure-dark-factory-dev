@@ -130,6 +130,36 @@ def timestamp(value):
     return parsed
 
 
+def validate_accepted_terms(config, terms):
+    require(type(terms) is dict
+            and set(terms) == {"policy_version", "slot_minutes",
+                               "reservation_duration_minutes",
+                               "cancellation_cutoff_minutes",
+                               "opening_hours", "capacities"})
+    version = terms.get("policy_version")
+    require(type(version) is int and version >= 0)
+    require(type(terms.get("slot_minutes")) is int
+            and 1 <= terms["slot_minutes"] <= 1440)
+    require(type(terms.get("reservation_duration_minutes")) is int
+            and 1 <= terms["reservation_duration_minutes"] <= 1440)
+    require(type(terms.get("cancellation_cutoff_minutes")) is int
+            and 0 <= terms["cancellation_cutoff_minutes"] <= 10080)
+    capacities = terms.get("capacities")
+    require(type(capacities) is dict
+            and set(capacities) == {table["id"] for table in config["tables"]}
+            and all(type(capacity) is int and 1 <= capacity <= 100
+                    for capacity in capacities.values()))
+    if version == 0:
+        expected = policies.initial(config)
+    else:
+        published = next((item for item in config["policies"]
+                          if item["policy_version"] == version), None)
+        require(published is not None)
+        expected = {key: value for key, value in published.items()
+                    if key != "effective_from"}
+    require(terms == expected)
+
+
 def validate_record(state, raw, historical=False):
     require(type(raw) is dict)
     identifier(raw, "reservation_id")
@@ -148,9 +178,10 @@ def validate_record(state, raw, historical=False):
     terms = raw.get("accepted_terms")
     config = state["restaurants"].get(raw.get("restaurant_id"))
     require(config is not None)
+    require("accepted_terms" not in raw or type(terms) is dict)
     if type(terms) is dict:
-        capacities = terms.get("capacities")
-        require(type(capacities) is dict and set(capacities) == {t["id"] for t in config["tables"]})
+        validate_accepted_terms(config, terms)
+        capacities = terms["capacities"]
         override = {
             "policy_version": terms.get("policy_version"),
             "slot_minutes": terms.get("slot_minutes"),
@@ -159,14 +190,6 @@ def validate_record(state, raw, historical=False):
             "opening_hours": terms.get("opening_hours"),
             "capacities": capacities,
         }
-        require(type(override["policy_version"]) is int and override["policy_version"] >= 0)
-        require(type(override["slot_minutes"]) is int and 1 <= override["slot_minutes"] <= 1440)
-        require(type(override["reservation_duration_minutes"]) is int
-                and 1 <= override["reservation_duration_minutes"] <= 1440)
-        require(type(override["cancellation_cutoff_minutes"]) is int
-                and 0 <= override["cancellation_cutoff_minutes"] <= 10080)
-        require(type(override["opening_hours"]) is list)
-        require(all(type(cap) is int and 1 <= cap <= 100 for cap in capacities.values()))
         config_for_candidate = override
         expected = candidate(state, candidate_raw, use_policies=False, policy_override=config_for_candidate)
     else:
@@ -180,11 +203,8 @@ def validate_record(state, raw, historical=False):
         require(identifier(raw, "user_id") in state["users"])
     revision = raw.get("revision", 1)
     require(type(revision) is int and revision >= 1)
-    if terms is not None:
-        require(set(terms) == {"policy_version", "slot_minutes", "reservation_duration_minutes",
-                               "cancellation_cutoff_minutes", "opening_hours", "capacities"})
     if "history" in raw:
-        validate_history(raw, revision, terms)
+        validate_history(raw, revision, terms, config)
     return raw
 
 
@@ -196,7 +216,7 @@ def with_legacy_terms(state, raw):
     record["accepted_terms"] = terms
     record.setdefault("history", [history_entry(
         1, record["created_at"], "created", create_changes(record), 1, terms)])
-    validate_history(record, record["revision"], terms)
+    validate_history(record, record["revision"], terms, config)
     return record
 
 
@@ -215,7 +235,7 @@ def history_entry(seq, at, event, changes, revision, accepted_terms):
             "revision": revision, "accepted_terms": deepcopy(accepted_terms)}
 
 
-def validate_history(record, revision, terms):
+def validate_history(record, revision, terms, config):
     entries = record["history"]
     require(type(entries) is list and len(entries) >= 1)
     require(len(entries) == revision)
@@ -229,6 +249,7 @@ def validate_history(record, revision, terms):
         require(type(entry.get("changes")) is list)
         require(type(entry.get("revision")) is int and entry["revision"] == index)
         require(type(entry.get("accepted_terms")) is dict)
+        validate_accepted_terms(config, entry["accepted_terms"])
         if entry["event"] == "cancelled":
             require(entry["changes"] == [] and index == len(entries)
                     and record.get("status") == "cancelled")
@@ -333,9 +354,14 @@ def import_state(envelope):
             require(parsed["id"] == rid)
             state["restaurants"][rid] = parsed
         references = set()
+        legacy_reservations = set()
         for rid, record in raw["reservations"].items():
             validate_record(state, record)
             require(record["reservation_id"] == rid and record["reference"] not in references)
+            if "history" in record:
+                require("accepted_terms" in record)
+            else:
+                legacy_reservations.add(rid)
             record = with_legacy_terms(state, record)
             if record["status"] == "confirmed":
                 check_occupancy(state, [record])
@@ -389,6 +415,11 @@ def import_state(envelope):
                         require(len(value) == 1 and response.get("table_id") == value[0])
                     else:
                         require(response.get(key) == value)
+                reservation_id = response.get("reservation_id")
+                current = state["reservations"].get(reservation_id)
+                require(current is not None and current["user_id"] == uid)
+                if reservation_id not in legacy_reservations:
+                    require("accepted_terms" in response)
             elif path == "/reservation-moves":
                 items = request.get("moves")
                 require(type(items) is list and 1 <= len(items) <= 8)
