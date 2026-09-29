@@ -1,0 +1,63 @@
+name: Stage 2 Isolated Harness
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  stage2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Stage 2 candidate
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show container environment
+        run: |
+          python --version
+          docker --version
+          docker info
+
+      - name: Clone pinned official challenge package
+        run: |
+          git clone https://github.com/band-ai/dark-factory-wearedevs.git challenge
+          git -C challenge checkout 803560d2a678ace1414465c098eb0ab5380ffade
+
+      - name: Install official harness
+        working-directory: challenge
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r harness/requirements.txt
+
+      - name: Run isolated Stage 1 and Stage 2 harnesses
+        working-directory: challenge
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          OUT="$GITHUB_WORKSPACE/stage2-harness-output"
+          set +e
+          python -m harness run \
+            --track tablekeeper \
+            --repo "$GITHUB_WORKSPACE" \
+            --stage 2 \
+            --mode isolated \
+            --out "$OUT"
+          EXIT_CODE=$?
+          echo "HARNESS EXIT CODE: $EXIT_CODE"
+          if [ -f "$OUT/report.json" ]; then
+            cat "$OUT/report.json"
+          fi
+          exit $EXIT_CODE
