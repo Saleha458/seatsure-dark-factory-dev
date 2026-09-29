@@ -144,6 +144,29 @@ class SeriesContracts(unittest.TestCase):
         self.assertEqual(replay_after_import, (200, original))
         self.assertEqual(restored.state, imported_before)
 
+    def test_cancelling_unmodified_occurrence_does_not_mark_exception(self):
+        anchor = self.book()
+        _, original = self.create_series(anchor["reference"], key="cancel-occurrence")
+        series_id = original["series_id"]
+        before = self.call("GET", f"/series/{series_id}", token=self.owner)[1]
+        occurrence_ref = before["occurrences"][1]["reference"]
+        cancelled = self.call("POST", f"/reservations/{occurrence_ref}/cancel",
+                              {}, self.owner)[1]
+        after = self.call("GET", f"/series/{series_id}", token=self.owner)[1]
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        self.assertEqual(after["occurrences"][0], before["occurrences"][0])
+        self.assertEqual(after["occurrences"][2], before["occurrences"][2])
+        self.assertFalse(after["occurrences"][1]["exception"])
+        self.assertEqual(after["occurrences"][1]["reservation"], cancelled)
+        state_after_cancel = copy.deepcopy(self.store.state)
+
+        repeated = self.call("POST", f"/reservations/{occurrence_ref}/cancel",
+                             {}, self.owner)[1]
+        self.assertEqual(repeated, cancelled)
+        self.assertEqual(self.call("GET", f"/series/{series_id}",
+                                   token=self.owner)[1], after)
+        self.assertEqual(self.store.state, state_after_cancel)
+
     def test_validation_ownership_cutoff_cancel_and_adoption_errors_are_atomic(self):
         anchor = self.book()
         self.assert_error("POST", "/series", {"anchor_reference": anchor["reference"],

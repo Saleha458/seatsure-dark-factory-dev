@@ -10,6 +10,10 @@ from app.store import Store
 from app.validation import APIError
 from contract_stage1 import fixture
 from test_stage3_policies import policy
+from test_stage2 import combined_fixture, free_port, http_call, start_service
+
+ROOT = Path(__file__).resolve().parents[2]
+STAGE2 = ROOT / "stage-2"
 
 
 class ImportedTermsContracts(unittest.TestCase):
@@ -107,6 +111,70 @@ class ImportedTermsContracts(unittest.TestCase):
                 "restaurant_id": "r1", "table_id": "t1",
                 "starts_at_local": "2035-09-24T18:00", "party_size": 2,
             }, {**headers, "Idempotency-Key": "destination"})[0], 200)
+
+    def test_real_stage2_pair_and_move_receipts_import_without_stage3_mutation(self):
+        port = free_port()
+        process = start_service(STAGE2, port)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            status, _, _, _ = http_call(
+                base, "POST", "/_test/reset", combined_fixture())
+            self.assertEqual(status, 204)
+            status, _, login, _ = http_call(base, "POST", "/auth/login", {
+                "email": "a@example.test", "password": "synthetic password",
+            })
+            self.assertEqual(status, 200)
+            token = login["token"]
+            headers = {"Authorization": "Bearer " + token}
+            pair_body = {
+                "restaurant_id": "r1", "table_ids": ["t1", "t2"],
+                "starts_at_local": "2035-09-24T18:00", "party_size": 6,
+            }
+            pair_key = "stage2-pair-receipt"
+            status, _, pair, _ = http_call(
+                base, "POST", "/reservations", pair_body,
+                {**headers, "Idempotency-Key": pair_key})
+            self.assertEqual(status, 201)
+            self.assertEqual(pair["table_ids"], ["t1", "t2"])
+            self.assertNotIn("accepted_terms", pair)
+
+            move_body = {"moves": [{
+                "reference": pair["reference"], "table_ids": ["t2", "t1"],
+                "starts_at_local": "2035-09-24T19:30",
+            }]}
+            move_key = "stage2-move-receipt"
+            status, _, moved, _ = http_call(
+                base, "POST", "/reservation-moves", move_body,
+                {**headers, "Idempotency-Key": move_key})
+            self.assertEqual(status, 201)
+            self.assertEqual(moved["reservations"][0]["table_ids"], ["t1", "t2"])
+            self.assertNotIn("accepted_terms", moved["reservations"][0])
+            status, _, exported, _ = http_call(base, "GET", "/_test/export")
+            self.assertEqual(status, 200)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+
+        destination = Store()
+        self.assertEqual(destination.dispatch(
+            "POST", "/_test/import", {}, exported, {})[0], 204)
+        stage3_headers = {"Authorization": "Bearer " + token}
+        listed = destination.dispatch(
+            "GET", "/reservations", {}, {}, stage3_headers)[1]["reservations"]
+        imported_pair = next(item for item in listed
+                             if item["reference"] == pair["reference"])
+        self.assertEqual(imported_pair["table_ids"], ["t1", "t2"])
+        self.assertEqual(imported_pair["starts_at_local"], "2035-09-24T19:30")
+        self.assertEqual(imported_pair["accepted_terms"]["policy_version"], 0)
+        before = copy.deepcopy(destination.state)
+        self.assertEqual(destination.dispatch(
+            "POST", "/reservations", {}, pair_body,
+            {**stage3_headers, "Idempotency-Key": pair_key}), (200, pair))
+        self.assertEqual(destination.dispatch(
+            "POST", "/reservation-moves", {}, move_body,
+            {**stage3_headers, "Idempotency-Key": move_key}), (200, moved))
+        self.assertEqual(destination.state, before)
 
 
 if __name__ == "__main__":

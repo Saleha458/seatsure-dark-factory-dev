@@ -36,6 +36,26 @@ class PackageLayout(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 self.assertIn(pattern, ignored)
 
+    def test_stage3_run_guide_matches_standalone_layout(self):
+        guide = (STAGE2 / "RUN.md").read_text(encoding="utf-8")
+        self.assertIn("Tablekeeper Stage 3", guide)
+        self.assertIn("from the `stage-3` directory", guide)
+        self.assertIn("tablekeeper-stage3", guide)
+        self.assertIn("policies", guide)
+        self.assertIn("history", guide)
+        self.assertIn("series", guide)
+        self.assertIn("collective-move", guide)
+        self.assertNotIn("stage-2 directory", guide)
+        self.assertNotIn("tablekeeper-stage2", guide)
+
+        workflow = STAGE2.parents[0] / ".github" / "workflows" / "stage3-harness.yml"
+        content = workflow.read_text(encoding="utf-8")
+        self.assertIn("--track tablekeeper", content)
+        self.assertIn("--stage 3", content)
+        self.assertIn("--mode isolated", content)
+        self.assertIn("803560d2a678ace1414465c098eb0ab5380ffade", content)
+        self.assertIn('exit $EXIT_CODE', content)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
