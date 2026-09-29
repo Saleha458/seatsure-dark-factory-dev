@@ -1,0 +1,76 @@
+name: Stage 1 Isolated Harness
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  stage1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout SeatSure development result
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show environment
+        run: |
+          python --version
+          docker --version
+          docker info
+
+      - name: Clone official hackathon package
+        run: |
+          git clone --depth 1 https://github.com/band-ai/dark-factory-wearedevs.git challenge
+
+      - name: Install official harness
+        working-directory: challenge
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r harness/requirements.txt
+          python -m harness --help
+
+      - name: Run isolated Stage 1 harness
+        working-directory: challenge
+        shell: bash
+        run: |
+          source .venv/bin/activate
+
+          OUT="$GITHUB_WORKSPACE/stage1-harness-output"
+
+          set +e
+
+          python -m harness run \
+            --track tablekeeper \
+            --repo "$GITHUB_WORKSPACE" \
+            --stage 1 \
+            --mode isolated \
+            --out "$OUT"
+
+          EXIT_CODE=$?
+
+          echo ""
+          echo "=============================="
+          echo "HARNESS EXIT CODE: $EXIT_CODE"
+          echo "=============================="
+
+          if [ -f "$OUT/report.json" ]; then
+            echo ""
+            echo "===== report.json ====="
+            cat "$OUT/report.json"
+          fi
+
+          echo ""
+          echo "===== generated files ====="
+          find "$OUT" -maxdepth 3 -type f -print 2>/dev/null || true
+
+          exit $EXIT_CODE
