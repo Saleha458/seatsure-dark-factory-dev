@@ -185,6 +185,59 @@ class Store:
         restaurant["revision"] = restaurant.get("revision", 0) + 1
         return self.series_response(state, series)
 
+    def commit_moves(self, state, proposed, now):
+        changed_records = []
+        changed_series = {}
+        for record in proposed:
+            current = state["reservations"][record["reservation_id"]]
+            changes = self.reservation_changes(current, record)
+            if not changes:
+                continue
+            record = dict(record)
+            record["revision"] = current.get("revision", 1) + 1
+            record["accepted_terms"] = policies.accepted(
+                state["restaurants"][record["restaurant_id"]],
+                record["starts_at_local"][:10])
+            record["history"] = deepcopy(current.get("history", []))
+            self.append_history(record, "changed", changes, now)
+            changed_records.append(record)
+            series, occurrence = self.series_for_reservation(
+                state, current["reservation_id"])
+            if series is not None:
+                entry = changed_series.setdefault(series["series_id"], (series, []))
+                entry[1].append(occurrence)
+
+        for record in changed_records:
+            state["reservations"][record["reservation_id"]] = record
+        for series, occurrences in changed_series.values():
+            for occurrence in occurrences:
+                occurrence["exception"] = True
+            series["revision"] += 1
+        if changed_records:
+            restaurant = state["restaurants"][changed_records[0]["restaurant_id"]]
+            restaurant["revision"] = restaurant.get("revision", 0) + 1
+
+    @staticmethod
+    def reservation_changes(current, proposed):
+        changes = []
+        before_tables = reservations.members(current)
+        after_tables = reservations.members(proposed)
+        if before_tables != after_tables:
+            if len(before_tables) == len(after_tables) == 1:
+                changes.append({"field": "table_id", "from": before_tables[0],
+                                "to": after_tables[0]})
+            else:
+                changes.append({"field": "table_ids", "from": before_tables,
+                                "to": after_tables})
+        if current["starts_at_local"] != proposed["starts_at_local"]:
+            changes.append({"field": "starts_at_local",
+                            "from": current["starts_at_local"],
+                            "to": proposed["starts_at_local"]})
+        if current["party_size"] != proposed["party_size"]:
+            changes.append({"field": "party_size", "from": current["party_size"],
+                            "to": proposed["party_size"]})
+        return changes
+
     def dispatch(self, method, path, query, body, headers):
         if method == "POST" and path == "/_test/reset":
             self.replace(transfer.fixture(body))
@@ -299,14 +352,18 @@ class Store:
                 response = reservations.public(record)
             elif path == "/reservation-moves":
                 proposed = reservations.moves(state, body, uid, now)
-                response = {"reservations": [reservations.public(r) for r in proposed]}
+                self.commit_moves(state, proposed, now)
+                response = {"reservations": [
+                    reservations.public(state["reservations"][record["reservation_id"]])
+                    for record in proposed]}
             else:
                 response = self.create_series(state, body, uid, now)
                 proposed = []
             receipt = {"user_id": uid, "method": method, "path": path, "key": key,
                        "request": deepcopy(body), "response": deepcopy(response)}
-            for record in proposed:
-                state["reservations"][record["reservation_id"]] = record
+            if path == "/reservations":
+                for record in proposed:
+                    state["reservations"][record["reservation_id"]] = record
             state["receipts"].append(receipt)
             return 201, response
         if method == "GET" and path == "/reservations":
@@ -334,23 +391,7 @@ class Store:
             if method == "PATCH" and len(parts) == 3:
                 now = datetime.now(UTC)
                 proposed = reservations.amendment(state, record, body, now)
-                changed = []
-                before_tables = reservations.members(record)
-                after_tables = reservations.members(proposed)
-                if before_tables != after_tables:
-                    if len(before_tables) == len(after_tables) == 1:
-                        changed.append({"field": "table_id", "from": before_tables[0],
-                                        "to": after_tables[0]})
-                    else:
-                        changed.append({"field": "table_ids", "from": before_tables,
-                                        "to": after_tables})
-                if record["starts_at_local"] != proposed["starts_at_local"]:
-                    changed.append({"field": "starts_at_local",
-                                    "from": record["starts_at_local"],
-                                    "to": proposed["starts_at_local"]})
-                if record["party_size"] != proposed["party_size"]:
-                    changed.append({"field": "party_size", "from": record["party_size"],
-                                    "to": proposed["party_size"]})
+                changed = self.reservation_changes(record, proposed)
                 if not changed:
                     return 200, reservations.public(record)
                 reservations.check_occupancy(state, [proposed], {record["reservation_id"]})

@@ -8,6 +8,7 @@ python -B -m unittest discover -s tests -p 'test_stage3_policies.py' -v
 python -B -m unittest discover -s tests -p 'test_stage3_availability.py' -v
 python -B -m unittest discover -s tests -p 'test_stage3_history.py' -v
 python -B -m unittest discover -s tests -p 'test_stage3_series.py' -v
+python -B -m unittest discover -s tests -p 'test_stage3_moves.py' -v
 python -B -m unittest discover -s tests -p 'test_stage2.py' -v
 python -B -m unittest discover -s tests -p 'test_core_*.py' -v
 python -B -m unittest discover -s tests -p 'test_packaging.py' -v
@@ -16,9 +17,10 @@ python -B -m unittest discover -s tests -p 'test_packaging.py' -v
 `test_packaging.py` checks that the app assets and test contracts are included in the
 standalone image, along with its timezone, non-root, port and health-check configuration.
 
-`test_stage3_policies.py`, `test_stage3_availability.py`, `test_stage3_history.py` and
-`test_stage3_series.py` exercise Stage 3 policy selection, accepted terms, revisions,
-history and recurring-series behavior. `test_stage2.py` exercises the inherited Stage 1
+`test_stage3_policies.py`, `test_stage3_availability.py`, `test_stage3_history.py`,
+`test_stage3_series.py` and `test_stage3_moves.py` exercise Stage 3 policy selection,
+accepted terms, revisions, history, recurring-series and collective-move behavior.
+`test_stage2.py` exercises the inherited Stage 1
 and Stage 2 APIs against their sibling directories, including state transfer, so it
 requires the complete result repository layout. The core tests run against Stage 3's
 public dispatcher and are self-contained.

@@ -165,8 +165,9 @@ def moves(state, body, uid, now):
     for item in items:
         record = owned(state, item["reference"], uid)
         require(not proposed or record["restaurant_id"] == proposed[0]["restaurant_id"])
-        proposed.append(amendment(state, record, item, now, stage3=False))
-    check_occupancy(state, proposed, {r["reservation_id"] for r in proposed})
+        proposed.append(amendment(state, record, item, now))
+    excluded = {item["reservation_id"] for item in proposed}
+    check_occupancy(state, proposed, excluded)
     return proposed
 
 
