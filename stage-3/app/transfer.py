@@ -13,7 +13,8 @@ from .validation import APIError, email_password, field, identifier, integer, re
 
 
 def empty_state():
-    return {"users": {}, "tokens": {}, "restaurants": {}, "reservations": {}, "receipts": []}
+    return {"users": {}, "tokens": {}, "restaurants": {}, "reservations": {},
+            "series": {}, "receipts": []}
 
 
 def object_list(body, name):
@@ -28,7 +29,8 @@ def restaurant_config(raw, user_ids=None, preserve_policies=False):
               "slot_minutes": integer(raw, "slot_minutes"),
               "reservation_duration_minutes": integer(raw, "reservation_duration_minutes"),
               "cancellation_cutoff_minutes": integer(raw, "cancellation_cutoff_minutes", 0),
-              "opening_hours": [], "tables": [], "policies": [], "policy_version": 0}
+              "opening_hours": [], "tables": [], "policies": [], "policy_version": 0,
+              "revision": 0}
     manager_user_ids = raw.get("manager_user_ids", [])
     require(type(manager_user_ids) is list, 400, "malformed_request")
     require(all(type(uid) is str for uid in manager_user_ids), 400, "malformed_request")
@@ -78,6 +80,9 @@ def restaurant_config(raw, user_ids=None, preserve_policies=False):
         require("policies" in raw and "policy_version" in raw)
         config["policies"], config["policy_version"] = policies.imported(
             config, raw["policies"], raw["policy_version"])
+    if preserve_policies and "revision" in raw:
+        require(type(raw["revision"]) is int and raw["revision"] >= 0)
+        config["revision"] = raw["revision"]
     return config
 
 
@@ -254,13 +259,52 @@ def validate_history(record, revision, terms):
         require(entries[-1]["accepted_terms"] == terms)
 
 
+def validate_series(state, raw_series):
+    require(type(raw_series) is dict)
+    result = {}
+    seen_reservations = set()
+    for series_id, raw in raw_series.items():
+        require(type(series_id) is str and 0 < len(series_id) <= 64)
+        require(type(raw) is dict and raw.get("series_id") == series_id)
+        restaurant_id = identifier(raw, "restaurant_id")
+        user_id = identifier(raw, "user_id")
+        require(restaurant_id in state["restaurants"] and user_id in state["users"])
+        revision = raw.get("revision")
+        interval_weeks = raw.get("interval_weeks")
+        require(type(revision) is int and revision >= 1)
+        require(type(interval_weeks) is int and 1 <= interval_weeks <= 4)
+        anchor_id = identifier(raw, "anchor_reservation_id")
+        occurrences = raw.get("occurrences")
+        require(type(occurrences) is list and 2 <= len(occurrences) <= 12)
+        require(set(raw) == {"series_id", "restaurant_id", "user_id", "revision",
+                             "interval_weeks", "anchor_reservation_id", "occurrences"})
+        for index, occurrence in enumerate(occurrences):
+            require(type(occurrence) is dict
+                    and set(occurrence) == {"index", "reservation_id", "exception"}
+                    and type(occurrence.get("index")) is int
+                    and occurrence.get("index") == index
+                    and type(occurrence.get("exception")) is bool)
+            reservation_id = identifier(occurrence, "reservation_id")
+            require(reservation_id not in seen_reservations)
+            record = state["reservations"].get(reservation_id)
+            require(record is not None and record["restaurant_id"] == restaurant_id
+                    and record["user_id"] == user_id)
+            if index == 0:
+                require(reservation_id == anchor_id)
+            seen_reservations.add(reservation_id)
+        require(occurrences[0]["reservation_id"] == anchor_id)
+        result[series_id] = deepcopy(raw)
+    return result
+
+
 def import_state(envelope):
     # The import contract overrides generic field-type errors for its envelope/state.
     try:
         require(envelope.get("track") == "tablekeeper")
         require(type(envelope.get("format_version")) is int and envelope["format_version"] == 1)
         raw = envelope.get("state")
-        require(type(raw) is dict and set(empty_state()).issubset(raw))
+        required_state = set(empty_state()) - {"series"}
+        require(type(raw) is dict and required_state.issubset(raw))
         require(all(type(raw[k]) is dict for k in ("users", "tokens", "restaurants", "reservations")))
         require(type(raw["receipts"]) is list)
         state = empty_state()
@@ -297,6 +341,14 @@ def import_state(envelope):
                 check_occupancy(state, [record])
             state["reservations"][rid] = deepcopy(record)
             references.add(record["reference"])
+        state["series"] = validate_series(state, raw.get("series", {}))
+        series_counts = {}
+        for series in state["series"].values():
+            restaurant_id = series["restaurant_id"]
+            series_counts[restaurant_id] = series_counts.get(restaurant_id, 0) + 1
+        require(all(config["revision"] >= series_counts.get(restaurant_id, 0)
+                    for restaurant_id, config in state["restaurants"].items()))
+        receipt_series = set()
         keys = set()
         for receipt in raw["receipts"]:
             require(type(receipt) is dict)
@@ -308,7 +360,8 @@ def import_state(envelope):
             if len(parts) == 4 and parts[1] == "restaurants" and parts[3] == "policies":
                 restaurant_id = unquote(parts[2])
                 is_policy_path = restaurant_id in state["restaurants"]
-            require(path in ("/reservations", "/reservation-moves") or is_policy_path)
+            is_series_path = path == "/series"
+            require(path in ("/reservations", "/reservation-moves") or is_policy_path or is_series_path)
             key = field(receipt, "key", str)
             require(1 <= len(key) <= 255)
             identity = (uid, path, key)
@@ -336,7 +389,7 @@ def import_state(envelope):
                         require(len(value) == 1 and response.get("table_id") == value[0])
                     else:
                         require(response.get(key) == value)
-            else:
+            elif path == "/reservation-moves":
                 items = request.get("moves")
                 require(type(items) is list and 1 <= len(items) <= 8)
                 require(all(type(i) is dict and type(i.get("reference")) is str for i in items))
@@ -356,16 +409,55 @@ def import_state(envelope):
                     else:
                         require(len(expected["table_ids"]) == 1
                                 and record.get("table_id") == expected["table_ids"][0])
+            else:
+                series_id = response.get("series_id")
+                series = state["series"].get(series_id)
+                anchor_reference = field(request, "anchor_reference", str)
+                count = request.get("count")
+                interval_weeks = request.get("interval_weeks")
+                historical = field(response, "occurrences", list)
+                require(series is not None and series["user_id"] == uid
+                        and type(count) is int and 2 <= count <= 12
+                        and type(interval_weeks) is int and 1 <= interval_weeks <= 4
+                        and type(response.get("revision")) is int
+                        and response.get("revision") == 1
+                        and response.get("interval_weeks") == interval_weeks
+                        and series["interval_weeks"] == interval_weeks
+                        and len(historical) == count
+                        and len(series["occurrences"]) == count
+                        and series["anchor_reservation_id"]
+                        == series["occurrences"][0]["reservation_id"])
+                anchor = state["reservations"][series["anchor_reservation_id"]]
+                require(anchor["reference"] == anchor_reference
+                        and response.get("series_id") == series_id)
+                receipt_series.add(series_id)
+                for index, (entry, occurrence) in enumerate(
+                        zip(historical, series["occurrences"])):
+                    require(type(entry) is dict and entry.get("index") == index
+                            and type(entry.get("index")) is int
+                            and type(entry.get("exception")) is bool
+                            and entry.get("exception") is False
+                            and type(entry.get("reservation")) is dict)
+                    saved = entry["reservation"]
+                    validate_record(state, saved, historical=True)
+                    require(saved.get("status") == "confirmed"
+                            and "user_id" not in saved
+                            and saved.get("reservation_id") == occurrence["reservation_id"]
+                            and saved.get("reference")
+                            == state["reservations"][occurrence["reservation_id"]]["reference"])
             if not is_policy_path:
-                for record in historical:
-                    validate_record(state, record, historical=True)
-                    require(record["status"] == "confirmed" and "user_id" not in record)
-                    current = state["reservations"].get(record["reservation_id"])
-                    require(current is not None and current["user_id"] == uid)
-                    require(all(record[k] == current[k] for k in ("reference", "restaurant_id", "created_at")))
-                require(len({r["restaurant_id"] for r in historical}) == 1)
-                check_occupancy(empty_state(), historical)
+                if not is_series_path:
+                    for record in historical:
+                        validate_record(state, record, historical=True)
+                        require(record["status"] == "confirmed" and "user_id" not in record)
+                        current = state["reservations"].get(record["reservation_id"])
+                        require(current is not None and current["user_id"] == uid)
+                        require(all(record[k] == current[k]
+                                    for k in ("reference", "restaurant_id", "created_at")))
+                    require(len({r["restaurant_id"] for r in historical}) == 1)
+                    check_occupancy(empty_state(), historical)
             state["receipts"].append(deepcopy(receipt))
+        require(receipt_series == set(state["series"]))
         return state
     except (APIError, KeyError, TypeError, ValueError, OverflowError):
         raise APIError() from None
