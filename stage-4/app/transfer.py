@@ -14,7 +14,7 @@ from .validation import APIError, email_password, field, identifier, integer, re
 
 def empty_state():
     return {"users": {}, "tokens": {}, "restaurants": {}, "reservations": {},
-            "series": {}, "receipts": []}
+            "series": {}, "closures": [], "plans": {}, "receipts": []}
 
 
 def object_list(body, name):
@@ -230,9 +230,12 @@ def create_changes(record):
             {"field": "party_size", "from": None, "to": record["party_size"]}]
 
 
-def history_entry(seq, at, event, changes, revision, accepted_terms):
-    return {"seq": seq, "at": at, "event": event, "changes": deepcopy(changes),
-            "revision": revision, "accepted_terms": deepcopy(accepted_terms)}
+def history_entry(seq, at, event, changes, revision, accepted_terms, plan_id=None):
+    entry = {"seq": seq, "at": at, "event": event, "changes": deepcopy(changes),
+             "revision": revision, "accepted_terms": deepcopy(accepted_terms)}
+    if plan_id is not None:
+        entry["plan_id"] = plan_id
+    return entry
 
 
 def validate_history(record, revision, terms, config):
@@ -243,8 +246,8 @@ def validate_history(record, revision, terms, config):
     for index, entry in enumerate(entries, 1):
         require(type(entry) is dict and entry.get("seq") == index)
         timestamp(entry.get("at"))
-        require(entry.get("event") in ("created", "changed", "cancelled"))
-        require(index == 1 or entry.get("event") in ("changed", "cancelled"))
+        require(entry.get("event") in ("created", "changed", "cancelled", "reassigned"))
+        require(index == 1 or entry.get("event") in ("changed", "cancelled", "reassigned"))
         require(index != 1 or entry.get("event") == "created")
         require(type(entry.get("changes")) is list)
         require(type(entry.get("revision")) is int and entry["revision"] == index)
@@ -253,6 +256,14 @@ def validate_history(record, revision, terms, config):
         if entry["event"] == "cancelled":
             require(entry["changes"] == [] and index == len(entries)
                     and record.get("status") == "cancelled")
+        elif entry["event"] == "reassigned":
+            plan_id = entry.get("plan_id")
+            require(type(plan_id) is str and 0 < len(plan_id) <= 64)
+            changes = entry["changes"]
+            require(len(changes) == 1 and type(changes[0]) is dict)
+            require(set(changes[0]) == {"field", "from", "to"}
+                    and changes[0].get("field") == "table_ids")
+            require(type(changes[0].get("from")) is list and type(changes[0].get("to")) is list)
         elif entry["event"] == "changed":
             changes = entry["changes"]
             fields = [change.get("field") for change in changes if type(change) is dict]
@@ -324,7 +335,7 @@ def import_state(envelope):
         require(envelope.get("track") == "tablekeeper")
         require(type(envelope.get("format_version")) is int and envelope["format_version"] == 1)
         raw = envelope.get("state")
-        required_state = set(empty_state()) - {"series"}
+        required_state = {"users", "tokens", "restaurants", "reservations", "receipts"}
         require(type(raw) is dict and required_state.issubset(raw))
         require(all(type(raw[k]) is dict for k in ("users", "tokens", "restaurants", "reservations")))
         require(type(raw["receipts"]) is list)
@@ -368,6 +379,28 @@ def import_state(envelope):
             state["reservations"][rid] = deepcopy(record)
             references.add(record["reference"])
         state["series"] = validate_series(state, raw.get("series", {}))
+        state["closures"] = []
+        for closure in raw.get("closures", []):
+            require(type(closure) is dict)
+            rid = identifier(closure, "restaurant_id")
+            require(rid in state["restaurants"])
+            config = state["restaurants"][rid]
+            table_id = field(closure, "table_id", str)
+            require(any(t["id"] == table_id for t in config["tables"]))
+            from_str = field(closure, "from", str)
+            to_str = field(closure, "to", str)
+            require(instant(from_str) < instant(to_str))
+            state["closures"].append({
+                "restaurant_id": rid, "table_id": table_id,
+                "from": from_str, "to": to_str,
+            })
+        state["plans"] = {}
+        for plan_id, plan in raw.get("plans", {}).items():
+            require(type(plan) is dict and type(plan_id) is str and 0 < len(plan_id) <= 64)
+            require(plan.get("plan_id") == plan_id)
+            rid = identifier(plan, "restaurant_id")
+            require(rid in state["restaurants"])
+            state["plans"][plan_id] = deepcopy(plan)
         series_counts = {}
         for series in state["series"].values():
             restaurant_id = series["restaurant_id"]
@@ -381,13 +414,15 @@ def import_state(envelope):
             uid = identifier(receipt, "user_id")
             require(uid in state["users"] and receipt.get("method") == "POST")
             path = field(receipt, "path", str)
-            is_policy_path = False
             parts = path.split("/")
-            if len(parts) == 4 and parts[1] == "restaurants" and parts[3] == "policies":
-                restaurant_id = unquote(parts[2])
-                is_policy_path = restaurant_id in state["restaurants"]
+            is_policy_path = len(parts) == 4 and parts[1] == "restaurants" and parts[3] == "policies"
+            is_replan_preview = len(parts) == 4 and parts[1] == "restaurants" and parts[3] == "replans"
+            is_replan_apply = len(parts) == 6 and parts[1] == "restaurants" and parts[3] == "replans" and parts[5] == "apply"
+            is_series_amend = len(parts) == 4 and parts[1] == "series" and parts[3] == "amend"
             is_series_path = path == "/series"
-            require(path in ("/reservations", "/reservation-moves") or is_policy_path or is_series_path)
+            require(path in ("/reservations", "/reservation-moves")
+                    or is_policy_path or is_series_path
+                    or is_replan_preview or is_replan_apply or is_series_amend)
             key = field(receipt, "key", str)
             require(1 <= len(key) <= 255)
             identity = (uid, path, key)
@@ -396,6 +431,8 @@ def import_state(envelope):
             request = field(receipt, "request", dict)
             response = field(receipt, "response", dict)
             if is_policy_path:
+                restaurant_id = unquote(parts[2])
+                require(restaurant_id in state["restaurants"])
                 config = state["restaurants"][restaurant_id]
                 version = response.get("policy_version")
                 require(type(version) is int and version >= 1)
@@ -405,6 +442,27 @@ def import_state(envelope):
                         and saved == {
                     **policies.validate(config, request), "policy_version": version
                 })
+                historical = []
+            elif is_replan_preview:
+                restaurant_id = unquote(parts[2])
+                require(restaurant_id in state["restaurants"])
+                config = state["restaurants"][restaurant_id]
+                require(uid in config["manager_user_ids"])
+                require(type(response) is dict and "plan_id" in response)
+                historical = []
+            elif is_replan_apply:
+                restaurant_id = unquote(parts[2])
+                require(restaurant_id in state["restaurants"])
+                config = state["restaurants"][restaurant_id]
+                require(uid in config["manager_user_ids"])
+                plan_id = unquote(parts[4])
+                require(type(response) is dict and response.get("plan_id") == plan_id)
+                historical = []
+            elif is_series_amend:
+                series_id = unquote(parts[2])
+                series = state["series"].get(series_id)
+                require(series is not None and series["user_id"] == uid)
+                require(type(response) is dict and response.get("series_id") == series_id)
                 historical = []
             elif path == "/reservations":
                 historical = [response]
@@ -476,7 +534,7 @@ def import_state(envelope):
                             and saved.get("reservation_id") == occurrence["reservation_id"]
                             and saved.get("reference")
                             == state["reservations"][occurrence["reservation_id"]]["reference"])
-            if not is_policy_path:
+            if not (is_policy_path or is_replan_preview or is_replan_apply or is_series_amend):
                 if not is_series_path:
                     for record in historical:
                         validate_record(state, record, historical=True)

@@ -94,6 +94,16 @@ def instant(value):
     return datetime.fromisoformat(value).astimezone(UTC)
 
 
+def parse_offset_instant(value):
+    require(type(value) is str, 422, "validation_failed")
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        raise APIError(422, "validation_failed") from None
+    require(dt.tzinfo is not None and dt.utcoffset() is not None, 422, "validation_failed")
+    return dt.astimezone(UTC)
+
+
 def overlaps(a, b):
     from .reservations import members
     return (a["restaurant_id"] == b["restaurant_id"]

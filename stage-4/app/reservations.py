@@ -84,7 +84,28 @@ def candidate(state, body, current=None, use_policies=True, policy_override=None
     merged.update(table_ids=list(table_ids), starts_at_local=local, starts_at=start,
                   ends_at=end, party_size=size)
     merged.pop("table_id", None)
+    if closed_during(state, rid, table_ids, start, end):
+        require(False, 409, "table_unavailable")
     return merged
+
+
+def overlaps_closure(probe, closure):
+    if probe.get("restaurant_id") != closure["restaurant_id"]:
+        return False
+    if closure["table_id"] not in members(probe):
+        return False
+    return (instant(probe["starts_at"]) < instant(closure["to"])
+            and instant(closure["from"]) < instant(probe["ends_at"]))
+
+
+def closed_during(state, restaurant_id, table_ids, starts_at, ends_at,
+                  extra_closures=()):
+    probe = {"restaurant_id": restaurant_id, "table_ids": list(table_ids),
+             "starts_at": starts_at, "ends_at": ends_at}
+    closures = [item for item in state.get("closures", [])
+                if item["restaurant_id"] == restaurant_id]
+    closures.extend(extra_closures)
+    return any(overlaps_closure(probe, closure) for closure in closures)
 
 
 def check_occupancy(state, candidates, excluded=()):
@@ -92,6 +113,9 @@ def check_occupancy(state, candidates, excluded=()):
               if rid not in excluded and r["status"] == "confirmed"]
     for proposed in candidates:
         require(not any(overlaps(proposed, r) for r in others), 409, "table_unavailable")
+        require(not closed_during(state, proposed["restaurant_id"],
+                                  proposed["table_ids"], proposed["starts_at"],
+                                  proposed["ends_at"]), 409, "table_unavailable")
         others.append(proposed)
 
 
@@ -217,7 +241,8 @@ def availability(state, query):
                 no_overlap_holds = not any(
                     r["status"] == "confirmed" and overlaps(probe, r)
                     for r in state["reservations"].values())
-                table_available = capacity_holds and no_overlap_holds
+                no_closure_holds = not closed_during(state, rid, [table_id], start, end)
+                table_available = capacity_holds and no_overlap_holds and no_closure_holds
                 if table_available:
                     available.append(table_id)
                     options.append({"table_ids": [table_id], "capacity": capacities[table_id]})
@@ -228,7 +253,7 @@ def availability(state, query):
                         "available": table_available,
                         "rules": [
                             {"rule": "capacity", "holds": capacity_holds},
-                            {"rule": "no_overlap", "holds": no_overlap_holds},
+                            {"rule": "no_overlap", "holds": no_overlap_holds and no_closure_holds},
                         ],
                     })
             for pair in config.get("combinable", []):
@@ -237,7 +262,8 @@ def availability(state, query):
                     continue
                 probe = {"restaurant_id": rid, "table_ids": pair, "starts_at": start, "ends_at": end}
                 if not any(r["status"] == "confirmed" and overlaps(probe, r)
-                           for r in state["reservations"].values()):
+                           for r in state["reservations"].values()) \
+                        and not closed_during(state, rid, pair, start, end):
                     options.append({"table_ids": list(pair), "capacity": capacity})
             slot = {"starts_at_local": value, "starts_at": start,
                     "available_table_ids": available, "available_options": options}

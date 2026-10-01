@@ -7,8 +7,9 @@ from threading import RLock
 from uuid import uuid4
 from urllib.parse import unquote
 
-from . import policies, reservations, security, transfer
-from .time_rules import UTC, instant, parse_local
+from . import planning, policies, reservations, security, transfer
+from .reservations import closed_during, members
+from .time_rules import UTC, instant, overlaps, parse_local, parse_offset_instant
 from .validation import email_password, field, json_equal, require
 
 
@@ -77,7 +78,7 @@ class Store:
         return record
 
     @staticmethod
-    def append_history(record, event, changes, at):
+    def append_history(record, event, changes, at, plan_id=None):
         entries = record.setdefault("history", [])
         if entries:
             previous = instant(entries[-1]["at"])
@@ -85,7 +86,7 @@ class Store:
                 at = previous
         entries.append(transfer.history_entry(
             len(entries) + 1, at.isoformat(), event, changes,
-            record["revision"], record["accepted_terms"]))
+            record["revision"], record["accepted_terms"], plan_id=plan_id))
 
     @staticmethod
     def series_for_reservation(state, reservation_id):
