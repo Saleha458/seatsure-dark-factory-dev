@@ -60,4 +60,8 @@ jobs:
           if [ -f "$OUT/report.json" ]; then
             cat "$OUT/report.json"
           fi
+          echo "===== STAGE 4 LOG ====="
+          if [ -f "$OUT/stage-4.log" ]; then
+            cat "$OUT/stage-4.log"
+          fi
           exit $EXIT_CODE
