@@ -409,6 +409,11 @@ def import_state(envelope):
                     for restaurant_id, config in state["restaurants"].items()))
         receipt_series = set()
         keys = set()
+        # Historical retry receipts predate later closures. Validate their original
+        # booking shapes against the same restaurant/policy state but without
+        # treating subsequently applied closures as if they existed at creation.
+        historical_state = dict(state)
+        historical_state["closures"] = []
         for receipt in raw["receipts"]:
             require(type(receipt) is dict)
             uid = identifier(receipt, "user_id")
@@ -466,7 +471,7 @@ def import_state(envelope):
                 historical = []
             elif path == "/reservations":
                 historical = [response]
-                expected = candidate(state, request, use_policies=False,
+                expected = candidate(historical_state, request, use_policies=False,
                                      policy_override=response.get("accepted_terms"))
                 for key, value in expected.items():
                     if key == "table_ids" and key not in response:
@@ -489,7 +494,7 @@ def import_state(envelope):
                 require(all(type(r) is dict and r.get("reference") == item["reference"]
                             for r, item in zip(historical, items)))
                 for record, item in zip(historical, items):
-                    expected = candidate(state, item, record, use_policies=False)
+                    expected = candidate(historical_state, item, record, use_policies=False)
                     for key in ("starts_at_local", "party_size"):
                         if key in item:
                             require(record.get(key) == expected[key])
@@ -537,7 +542,7 @@ def import_state(envelope):
             if not (is_policy_path or is_replan_preview or is_replan_apply or is_series_amend):
                 if not is_series_path:
                     for record in historical:
-                        validate_record(state, record, historical=True)
+                        validate_record(historical_state, record, historical=True)
                         require(record["status"] == "confirmed" and "user_id" not in record)
                         current = state["reservations"].get(record["reservation_id"])
                         require(current is not None and current["user_id"] == uid)

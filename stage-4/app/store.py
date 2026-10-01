@@ -239,6 +239,214 @@ class Store:
                             "to": proposed["party_size"]})
         return changes
 
+    def receipt_for(self, state, uid, method, path, key, body):
+        require(type(key) is str and key != "", 400, "missing_idempotency_key")
+        require(len(key) <= 255)
+        receipt = next((item for item in state["receipts"]
+                        if item["user_id"] == uid and item["method"] == method
+                        and item["path"] == path and item["key"] == key), None)
+        if receipt is not None:
+            require(json_equal(body, receipt["request"]), 409, "idempotency_key_reuse")
+        return receipt
+
+    @staticmethod
+    def save_receipt(state, uid, method, path, key, body, response):
+        state["receipts"].append({
+            "user_id": uid, "method": method, "path": path, "key": key,
+            "request": deepcopy(body), "response": deepcopy(response),
+        })
+
+    def original_series_dates(self, state, series):
+        series_id = series["series_id"]
+        receipt = next((item for item in state["receipts"]
+                        if item.get("path") == "/series"
+                        and type(item.get("response")) is dict
+                        and item["response"].get("series_id") == series_id), None)
+        require(receipt is not None)
+        occurrences = receipt["response"].get("occurrences")
+        require(type(occurrences) is list
+                and len(occurrences) == len(series["occurrences"]))
+        dates = []
+        for index, entry in enumerate(occurrences):
+            require(type(entry) is dict and entry.get("index") == index)
+            saved = entry.get("reservation")
+            require(type(saved) is dict)
+            value = saved.get("starts_at_local")
+            require(type(value) is str and re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}", value))
+            dates.append(value[:10])
+        return dates
+
+    def amend_series(self, state, series, body, now):
+        expected = body.get("expected_revision")
+        require(type(expected) is int and expected >= 1)
+        require(expected == series["revision"], 409, "stale_revision")
+        from_index = body.get("from_index")
+        require(type(from_index) is int and 0 <= from_index < len(series["occurrences"]))
+        local_time = body.get("local_time")
+        require(type(local_time) is str, 400, "malformed_request")
+        require(re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", local_time) is not None)
+
+        scheduled_dates = self.original_series_dates(state, series)
+        changes = []
+        for occurrence in series["occurrences"][from_index:]:
+            if occurrence["exception"]:
+                continue
+            current = state["reservations"][occurrence["reservation_id"]]
+            if current["status"] != "confirmed":
+                continue
+            desired_local = scheduled_dates[occurrence["index"]] + "T" + local_time
+            if desired_local == current["starts_at_local"]:
+                continue
+            proposed = reservations.amendment(
+                state, current, {"starts_at_local": desired_local}, now)
+            changes.append((current, proposed))
+
+        if not changes:
+            return self.series_response(state, series)
+
+        proposed_records = [record for _, record in changes]
+        excluded = {record["reservation_id"] for record in proposed_records}
+        reservations.check_occupancy(state, proposed_records, excluded)
+
+        for current, proposed in changes:
+            proposed = dict(proposed)
+            proposed["revision"] = current.get("revision", 1) + 1
+            proposed["history"] = deepcopy(current.get("history", []))
+            event_changes = self.reservation_changes(current, proposed)
+            self.append_history(proposed, "changed", event_changes, now)
+            state["reservations"][current["reservation_id"]] = proposed
+
+        series["revision"] += 1
+        restaurant = state["restaurants"][series["restaurant_id"]]
+        restaurant["revision"] = restaurant.get("revision", 0) + 1
+        return self.series_response(state, series)
+
+    def preview_replan(self, state, restaurant_id, body, uid):
+        config = reservations.restaurant(state, restaurant_id)
+        require(uid in config["manager_user_ids"], 403, "forbidden")
+        table_id = field(body, "table_id", str)
+        require(0 < len(table_id) <= 64)
+        require(any(table["id"] == table_id for table in config["tables"]),
+                404, "not_found")
+        from_iso = field(body, "from", str)
+        to_iso = field(body, "to", str)
+        preview = planning.preview_plan(
+            state, restaurant_id, table_id, from_iso, to_iso)
+
+        plan_id = uuid4().hex
+        while plan_id in state["plans"]:
+            plan_id = uuid4().hex
+        captured_revision = config.get("revision", 0)
+        response = {
+            "plan_id": plan_id,
+            "restaurant_id": restaurant_id,
+            "restaurant_revision": captured_revision,
+            "closure": deepcopy(preview["closure"]),
+            "assignments": deepcopy(preview["assignments"]),
+            "moved_count": preview["moved_count"],
+            "unused_seats": preview["unused_seats"],
+        }
+        snapshots = {}
+        for row in preview["considered"]:
+            record = state["reservations"][row["reservation_id"]]
+            snapshots[row["reservation_id"]] = {
+                "revision": record.get("revision", 1),
+                "status": record["status"],
+                "starts_at": record["starts_at"],
+                "ends_at": record["ends_at"],
+                "table_ids": members(record),
+            }
+        state["plans"][plan_id] = {
+            **deepcopy(response),
+            "considered": deepcopy(preview["considered"]),
+            "snapshots": snapshots,
+            "applied": False,
+        }
+        return response
+
+    def apply_replan(self, state, restaurant_id, plan_id, body, uid, now):
+        require(body == {})
+        config = reservations.restaurant(state, restaurant_id)
+        require(uid in config["manager_user_ids"], 403, "forbidden")
+        plan = state["plans"].get(plan_id)
+        require(plan is not None and plan.get("restaurant_id") == restaurant_id,
+                404, "not_found")
+        require(not plan.get("applied", False), 409, "plan_already_applied")
+        require(config.get("revision", 0) == plan.get("restaurant_revision"),
+                409, "stale_revision")
+
+        closure = {
+            "restaurant_id": restaurant_id,
+            "table_id": plan["closure"]["table_id"],
+            "from": plan["closure"]["from"],
+            "to": plan["closure"]["to"],
+        }
+        changed = []
+        all_candidates = []
+        considered_ids = set()
+        changed_series = {}
+        assignments_by_reference = {
+            item["reference"]: item for item in plan.get("assignments", [])
+        }
+        for row in plan.get("considered", []):
+            reservation_id = row["reservation_id"]
+            current = state["reservations"].get(reservation_id)
+            snapshot = plan.get("snapshots", {}).get(reservation_id)
+            require(current is not None and snapshot is not None, 409, "stale_revision")
+            require(current.get("revision", 1) == snapshot["revision"]
+                    and current["status"] == snapshot["status"]
+                    and current["starts_at"] == snapshot["starts_at"]
+                    and current["ends_at"] == snapshot["ends_at"]
+                    and members(current) == snapshot["table_ids"],
+                    409, "stale_revision")
+            assignment = assignments_by_reference.get(current["reference"])
+            require(assignment is not None)
+            target_tables = list(assignment["table_ids"])
+            proposed = dict(current)
+            proposed["table_ids"] = target_tables
+            proposed.pop("table_id", None)
+            require(not closed_during(
+                state, restaurant_id, target_tables,
+                proposed["starts_at"], proposed["ends_at"],
+                extra_closures=[closure]), 409, "table_unavailable")
+            all_candidates.append(proposed)
+            considered_ids.add(reservation_id)
+            if members(current) != target_tables:
+                changed.append((current, proposed))
+
+        reservations.check_occupancy(state, all_candidates, considered_ids)
+
+        for current, proposed in changed:
+            proposed = dict(proposed)
+            proposed["revision"] = current.get("revision", 1) + 1
+            proposed["history"] = deepcopy(current.get("history", []))
+            self.append_history(proposed, "reassigned", [{
+                "field": "table_ids", "from": members(current),
+                "to": list(proposed["table_ids"]),
+            }], now, plan_id=plan_id)
+            state["reservations"][current["reservation_id"]] = proposed
+            series, _ = self.series_for_reservation(state, current["reservation_id"])
+            if series is not None:
+                changed_series[series["series_id"]] = series
+
+        for series in changed_series.values():
+            series["revision"] += 1
+        state["closures"].append(closure)
+        config["revision"] = config.get("revision", 0) + 1
+        plan["applied"] = True
+        plan["applied_restaurant_revision"] = config["revision"]
+        response = {
+            "plan_id": plan_id,
+            "restaurant_id": restaurant_id,
+            "restaurant_revision": config["revision"],
+            "closure": deepcopy(plan["closure"]),
+            "assignments": deepcopy(plan["assignments"]),
+            "moved_count": plan["moved_count"],
+            "unused_seats": plan["unused_seats"],
+        }
+        return response
+
     def dispatch(self, method, path, query, body, headers):
         if method == "POST" and path == "/_test/reset":
             self.replace(transfer.fixture(body))
@@ -297,6 +505,46 @@ class Store:
             require(uid is not None and series is not None and series["user_id"] == uid,
                     404, "not_found")
             return 200, self.series_response(state, series)
+        if method == "POST" and len(parts) == 4 and parts[1] == "series" \
+                and parts[3] == "amend":
+            uid = self.authenticate(headers)
+            series_id = unquote(parts[2])
+            series = state["series"].get(series_id)
+            require(series is not None and series["user_id"] == uid, 404, "not_found")
+            key = headers.get("Idempotency-Key", "")
+            receipt = self.receipt_for(state, uid, method, path, key, body)
+            if receipt is not None:
+                return 200, receipt["response"]
+            now = datetime.now(UTC)
+            response = self.amend_series(state, series, body, now)
+            self.save_receipt(state, uid, method, path, key, body, response)
+            return 201, response
+        if method == "POST" and len(parts) == 4 and parts[1] == "restaurants" \
+                and parts[3] == "replans":
+            rid = unquote(parts[2])
+            require(0 < len(rid) <= 64)
+            uid = self.authenticate(headers)
+            key = headers.get("Idempotency-Key", "")
+            receipt = self.receipt_for(state, uid, method, path, key, body)
+            if receipt is not None:
+                return 200, receipt["response"]
+            response = self.preview_replan(state, rid, body, uid)
+            self.save_receipt(state, uid, method, path, key, body, response)
+            return 201, response
+        if method == "POST" and len(parts) == 6 and parts[1] == "restaurants" \
+                and parts[3] == "replans" and parts[5] == "apply":
+            rid = unquote(parts[2])
+            plan_id = unquote(parts[4])
+            require(0 < len(rid) <= 64 and 0 < len(plan_id) <= 64)
+            uid = self.authenticate(headers)
+            key = headers.get("Idempotency-Key", "")
+            receipt = self.receipt_for(state, uid, method, path, key, body)
+            if receipt is not None:
+                return 200, receipt["response"]
+            now = datetime.now(UTC)
+            response = self.apply_replan(state, rid, plan_id, body, uid, now)
+            self.save_receipt(state, uid, method, path, key, body, response)
+            return 201, response
         if method == "POST" and len(parts) == 4 and parts[1] == "restaurants" and parts[3] == "policies":
             rid = unquote(parts[2])
             require(0 < len(rid) <= 64)
